@@ -175,11 +175,11 @@ def build_mdp(args):
             "headless": True,
             "hide_menu_on_startup": True,
             # Top-down view with the table's long axis along the image width;
-            # distance tuned so the table (incl. rims) nearly fills the frame
-            # at the default 128x72 (table aspect is 2.128/1.218 ~ 1.75).
+            # distance tuned so the table length (2.128 m incl. rims) nearly
+            # fills the frame width at the default square 256x256.
             "camera_params": {
                 "static": dict(
-                    distance=1.6, elevation=-90.0, azimuth=90.0, lookat=(0.0, 0.0, 0.0)
+                    distance=2.66, elevation=-90.0, azimuth=90.0, lookat=(0.0, 0.0, 0.0)
                 )
             },
             "default_camera_mode": "static",
@@ -360,8 +360,8 @@ def main():
     parser.add_argument("--steps", type=int, default=45000,
                         help="Steps per game (45000 = full 15 min game)")
     parser.add_argument("--out", default="data_2023")
-    parser.add_argument("--width", type=int, default=128)
-    parser.add_argument("--height", type=int, default=72)
+    parser.add_argument("--width", type=int, default=256)
+    parser.add_argument("--height", type=int, default=256)
     parser.add_argument("--fps", type=int, default=50, help="Video fps (env runs at 50 Hz)")
     parser.add_argument("--keep-scoreboard", action="store_true",
                         help="Keep the scoreboard overlay baked into the frames")
