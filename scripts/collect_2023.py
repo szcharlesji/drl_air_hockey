@@ -110,6 +110,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
+import mujoco
 import numpy as np
 from air_hockey_challenge.framework import AirHockeyChallengeWrapper
 from air_hockey_challenge.utils.tournament_agent_wrapper import (
@@ -183,10 +184,22 @@ def set_puck_radius(mdp, radius):
     model.geom_aabb[puck_geom.id][:3] = 0.0
     model.geom_aabb[puck_geom.id][3:] = (radius, radius, puck_geom.size[1])
     body = model.body("puck")
+    # MuJoCo >= 2.3.6 also prunes collisions with a static BVH whose leaf
+    # AABBs are compile-time copies of the geom AABBs. Mesh (short-end rim)
+    # and mallet contact pairs go through it; without this update they
+    # engage (r - default_r) late and the solver ejects the puck at
+    # hundreds of m/s (box side rims use the analytic collider and were
+    # unaffected — hence "only the players' sides misbehave").
+    leaf = model.body_bvhadr[body.id]
+    model.bvh_aabb[leaf][:3] = model.geom_pos[puck_geom.id]
+    model.bvh_aabb[leaf][3:] = (radius, radius, puck_geom.size[1])
     height = 2.0 * puck_geom.size[1]
     body.mass[0] *= scale**2
     body.inertia[0] = body.inertia[1] = body.mass[0] * (3 * radius**2 + height**2) / 12
     body.inertia[2] = 0.5 * body.mass[0] * radius**2
+    # Recompute mass-derived solver constants (invweight0 etc.); after this
+    # the mutated model matches a recompiled model with the new size exactly.
+    mujoco.mj_setConst(model, mdp.base_env._data)
     puck_site = model.site("puck_site")
     puck_site.size[0] = radius
     body_id = body.id
