@@ -128,6 +128,20 @@ def build_mdp(args):
     return mdp
 
 
+def close_mdp(mdp):
+    """Stop the env and free its EGL context deterministically.
+
+    mujoco.egl terminates the EGL display via atexit; MujocoViewer.stop()
+    never frees headless GL contexts, so without this they get finalized
+    after the display is gone and __del__ raises EGL_NOT_INITIALIZED
+    ("Exception ignored" noise at interpreter shutdown).
+    """
+    viewer = mdp.base_env._viewer
+    mdp.base_env.stop()
+    if viewer is not None and getattr(viewer, "_opengl_context", None) is not None:
+        viewer._opengl_context.free()
+
+
 def open_video_writer(path, width, height, fps):
     return subprocess.Popen(
         ["ffmpeg", "-y", "-loglevel", "error",
@@ -252,13 +266,14 @@ def main():
         np.random.seed(args.seed + game)
         if game > 0:
             # score/faults persist on the env instance; rebuild per game.
-            mdp.base_env.stop()
+            close_mdp(mdp)
             mdp = build_mdp(args)
         meta = collect_game(run_dir / f"game_{game:03d}", mdp, agent, args)
         print(
             f"game_{game:03d}: {meta['n_episodes']} episodes, "
             f"score {meta['final_score']}, {meta['steps_per_s']} steps/s"
         )
+    close_mdp(mdp)
     print(f"Data written to: {run_dir}")
 
 
