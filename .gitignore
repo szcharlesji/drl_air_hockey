@@ -32,3 +32,8 @@ venv/
 
 ## Datasets
 **/datasets/
+
+## 2023 stack outputs and pretrained checkpoints
+logs_2023/
+data_2023/
+drl_air_hockey/agents/models/
