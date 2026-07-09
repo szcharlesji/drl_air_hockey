@@ -165,10 +165,12 @@ class EpisodeBuffer:
 def set_puck_radius(mdp, radius):
     """Resize the puck in the compiled model (collision geom + visual sites).
 
-    The policy's input layout is independent of puck size; env_info is
-    updated so agents built afterwards normalize positions consistently.
-    Large deviations from the trained 0.03165 m are out-of-distribution
-    physics for the pretrained policies.
+    Mass and inertia scale as for a same-material, same-thickness disc
+    (mass ~ r^2, Izz = m r^2 / 2), keeping the dynamics self-consistent.
+    env_info is deliberately left at the trained constants: the policy's
+    obs normalization is part of its training contract. Large deviations
+    from the trained 0.03165 m remain out-of-distribution physics for the
+    pretrained policies, so expect degraded play, not identical games.
     """
     model = mdp.base_env._model
     puck_geom = model.geom("puck")
@@ -177,14 +179,18 @@ def set_puck_radius(mdp, radius):
     # Collision culling uses the precompiled bounding radius; recompute it
     # or an enlarged puck misses contacts.
     model.geom_rbound[puck_geom.id] = float(np.hypot(radius, puck_geom.size[1]))
+    body = model.body("puck")
+    height = 2.0 * puck_geom.size[1]
+    body.mass[0] *= scale**2
+    body.inertia[0] = body.inertia[1] = body.mass[0] * (3 * radius**2 + height**2) / 12
+    body.inertia[2] = 0.5 * body.mass[0] * radius**2
     puck_site = model.site("puck_site")
     puck_site.size[0] = radius
-    body_id = model.body("puck").id
+    body_id = body.id
     for site_id in range(model.nsite):
         # The unnamed rotation-indicator dot: keep it inside the disc.
         if model.site_bodyid[site_id] == body_id and site_id != puck_site.id:
             model.site_pos[site_id][0] *= scale
-    mdp.base_env.env_info["puck"]["radius"] = radius
 
 
 def build_mdp(args):
