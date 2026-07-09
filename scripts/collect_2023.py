@@ -162,6 +162,31 @@ class EpisodeBuffer:
         )
 
 
+def set_puck_radius(mdp, radius):
+    """Resize the puck in the compiled model (collision geom + visual sites).
+
+    The policy's input layout is independent of puck size; env_info is
+    updated so agents built afterwards normalize positions consistently.
+    Large deviations from the trained 0.03165 m are out-of-distribution
+    physics for the pretrained policies.
+    """
+    model = mdp.base_env._model
+    puck_geom = model.geom("puck")
+    scale = radius / puck_geom.size[0]
+    puck_geom.size[0] = radius
+    # Collision culling uses the precompiled bounding radius; recompute it
+    # or an enlarged puck misses contacts.
+    model.geom_rbound[puck_geom.id] = float(np.hypot(radius, puck_geom.size[1]))
+    puck_site = model.site("puck_site")
+    puck_site.size[0] = radius
+    body_id = model.body("puck").id
+    for site_id in range(model.nsite):
+        # The unnamed rotation-indicator dot: keep it inside the disc.
+        if model.site_bodyid[site_id] == body_id and site_id != puck_site.id:
+            model.site_pos[site_id][0] *= scale
+    mdp.base_env.env_info["puck"]["radius"] = radius
+
+
 def build_mdp(args):
     mdp = AirHockeyChallengeWrapper(
         "tournament",
@@ -190,6 +215,8 @@ def build_mdp(args):
         # drop it so no text is baked into the training frames. The viewer is
         # created lazily on the first render(), so this is early enough.
         mdp.base_env._viewer_params["custom_render_callback"] = None
+    if args.puck_radius is not None:
+        set_puck_radius(mdp, args.puck_radius)
     return mdp
 
 
@@ -296,6 +323,7 @@ def collect_game(game_dir, mdp, agent, args):
         "width": args.width,
         "height": args.height,
         "fps": args.fps,
+        "puck_radius": args.puck_radius,
         "jax_backend": jax.default_backend(),
         "wall_time_s": round(elapsed, 1),
         "steps_per_s": round(args.steps / elapsed, 1),
@@ -334,6 +362,8 @@ def spawn_workers(args, run_dir):
         ]
         if args.keep_scoreboard:
             cmd.append("--keep-scoreboard")
+        if args.puck_radius is not None:
+            cmd += ["--puck-radius", str(args.puck_radius)]
         if args.platform:
             cmd += ["--platform", args.platform]
         if args.gpu is not None:
@@ -366,6 +396,9 @@ def main():
     parser.add_argument("--keep-scoreboard", action="store_true",
                         help="Keep the scoreboard overlay baked into the frames")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--puck-radius", type=float, default=None,
+                        help="Puck radius in meters (model default: 0.03165); "
+                             "resizes collision and visuals at runtime")
     parser.add_argument("--gpu", type=int, default=None,
                         help="nvidia-smi GPU index to pin both inference (CUDA) "
                              "and rendering (EGL) to; default lets each library "
