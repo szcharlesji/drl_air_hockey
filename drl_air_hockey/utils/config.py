@@ -42,9 +42,12 @@ def config_dreamerv3(
                     + "_"
                     + strategy_to_str(AGENT_STRATEGY),
                 ),
-                "jax.platform": "cpu",
+                "jax.platform": environ.get("DRL_AIR_HOCKEY_JAX_PLATFORM", "cpu"),
                 "jax.precision": "float32",
-                "jax.prealloc": True,
+                "jax.prealloc": environ.get(
+                    "DRL_AIR_HOCKEY_JAX_PREALLOC", "true"
+                ).lower()
+                == "true",
                 "imag_horizon": 50,
                 # encoder/decoder obs keys
                 "encoder.mlp_keys": "vector",
