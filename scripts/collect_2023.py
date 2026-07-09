@@ -23,11 +23,14 @@ Episode file layout (DreamerV3 obs-first convention; T actions, T+1 states):
     score       int32   (T+1, 2)        running score at s_k (agent1, agent2)
     faults      int32   (T+1, 2)        running fault count at s_k
 
-Example:
+Examples:
     python scripts/collect_2023.py --model1 tournament_aggressive \
         --model2 tournament_aggressive --games 2 --steps 5000
+    # Throughput scales with CPU workers (physics is the bottleneck):
+    python scripts/collect_2023.py --workers 16 --platform cpu --games 16
 """
 import os
+import sys
 
 # Must be set before mujoco / drl_air_hockey imports. EGL renders headless on
 # the GPU; the DRL_AIR_HOCKEY_* variables opt agent inference into the GPU
@@ -35,10 +38,62 @@ import os
 # can override, e.g. CUDA_VISIBLE_DEVICES=1 or DRL_AIR_HOCKEY_JAX_PLATFORM=cpu.
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+# --platform must take effect before jax initializes, i.e. before argparse.
+if "--platform" in sys.argv[:-1]:
+    os.environ.setdefault(
+        "DRL_AIR_HOCKEY_JAX_PLATFORM", sys.argv[sys.argv.index("--platform") + 1]
+    )
 os.environ.setdefault("DRL_AIR_HOCKEY_JAX_PLATFORM", "gpu")
 # Two dreamerv3 Agent instances share this process; preallocating 75% of
 # VRAM per XLA client is unnecessary and hostile to a shared GPU.
 os.environ.setdefault("DRL_AIR_HOCKEY_JAX_PREALLOC", "false")
+
+
+def _egl_device_for_cuda(cuda_index):
+    """Map an nvidia-smi/CUDA device index to mujoco's EGL device index.
+
+    EGL enumerates devices in its own order (reversed relative to CUDA on
+    some hosts, plus non-CUDA software devices), so MUJOCO_EGL_DEVICE_ID
+    cannot reuse the CUDA index. NVIDIA's driver exposes each EGL device's
+    CUDA index through the EGL_CUDA_DEVICE_NV attribute.
+    """
+    import ctypes
+
+    from OpenGL import EGL
+
+    device_t = ctypes.c_void_p
+    attrib_t = ctypes.c_ssize_t
+    EGL_CUDA_DEVICE_NV = 0x323A
+    query_devices = ctypes.CFUNCTYPE(
+        ctypes.c_uint, ctypes.c_int, ctypes.POINTER(device_t),
+        ctypes.POINTER(ctypes.c_int),
+    )(EGL.eglGetProcAddress("eglQueryDevicesEXT"))
+    query_attrib = ctypes.CFUNCTYPE(
+        ctypes.c_uint, device_t, ctypes.c_int, ctypes.POINTER(attrib_t)
+    )(EGL.eglGetProcAddress("eglQueryDeviceAttribEXT"))
+    count = ctypes.c_int()
+    query_devices(0, None, ctypes.byref(count))
+    devices = (device_t * count.value)()
+    query_devices(count.value, devices, ctypes.byref(count))
+    for i in range(count.value):
+        attrib = attrib_t()
+        ok = query_attrib(devices[i], EGL_CUDA_DEVICE_NV, ctypes.byref(attrib))
+        if ok and attrib.value == cuda_index:
+            return i
+    raise RuntimeError(f"No EGL device maps to CUDA device {cuda_index}")
+
+
+# --gpu pins BOTH inference (CUDA) and rendering (EGL) to one nvidia-smi
+# device. It must take effect before jax/mujoco initialize, hence this early
+# argv scan instead of argparse (which runs after the imports below).
+if "--gpu" in sys.argv[:-1]:
+    _gpu = sys.argv[sys.argv.index("--gpu") + 1]
+    os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+    # Query the EGL mapping BEFORE restricting CUDA visibility: the driver
+    # reports EGL_CUDA_DEVICE_NV in terms of the currently visible devices,
+    # so setting CUDA_VISIBLE_DEVICES first would renumber them.
+    os.environ.setdefault("MUJOCO_EGL_DEVICE_ID", str(_egl_device_for_cuda(int(_gpu))))
+    os.environ.setdefault("CUDA_VISIBLE_DEVICES", _gpu)
 
 import argparse
 import json
@@ -179,7 +234,8 @@ def collect_game(game_dir, mdp, agent, args):
     # Both agent types have empty preprocessor lists, so Core._preprocess is
     # skipped here; revisit if agents ever register preprocessors.
     state, buffer = reset_episode(mdp, agent, video)
-    for _ in tqdm(range(args.steps), desc=game_dir.name, unit="step"):
+    for _ in tqdm(range(args.steps), desc=game_dir.name, unit="step",
+                  disable=args.no_progress):
         action_1, action_2, _, _ = agent.draw_action(state)
         obs, _, absorbing, info = mdp.step((action_1, action_2))
         frame = mdp.render(record=True)
@@ -236,6 +292,39 @@ def collect_game(game_dir, mdp, agent, args):
     return meta
 
 
+def spawn_workers(args, run_dir):
+    """Split games across worker subprocesses writing into one run dir."""
+    base, extra = divmod(args.games, args.workers)
+    procs = []
+    game_start = 0
+    for worker in range(args.workers):
+        n_games = base + (1 if worker < extra else 0)
+        if n_games == 0:
+            break
+        cmd = [
+            sys.executable, os.path.abspath(__file__),
+            "--model1", args.model1, "--model2", args.model2,
+            "--games", str(n_games), "--steps", str(args.steps),
+            "--width", str(args.width), "--height", str(args.height),
+            "--fps", str(args.fps), "--seed", str(args.seed),
+            "--run-dir", str(run_dir), "--game-start", str(game_start),
+            "--no-progress",
+        ]
+        if args.keep_scoreboard:
+            cmd.append("--keep-scoreboard")
+        if args.platform:
+            cmd += ["--platform", args.platform]
+        if args.gpu is not None:
+            cmd += ["--gpu", str(args.gpu)]
+        env = dict(os.environ)
+        # Keep each worker single-threaded so N workers don't oversubscribe
+        # the box; MuJoCo physics dominates and is single-threaded anyway.
+        env.setdefault("OMP_NUM_THREADS", "1")
+        procs.append(subprocess.Popen(cmd, env=env))
+        game_start += n_games
+    return all(proc.wait() == 0 for proc in procs)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model1", default="tournament_balanced", choices=MODELS)
@@ -250,9 +339,39 @@ def main():
     parser.add_argument("--keep-scoreboard", action="store_true",
                         help="Keep the scoreboard overlay baked into the frames")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--gpu", type=int, default=None,
+                        help="nvidia-smi GPU index to pin both inference (CUDA) "
+                             "and rendering (EGL) to; default lets each library "
+                             "pick its own device")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Parallel collector processes; games are split "
+                             "among them (rendering still uses the GPU)")
+    parser.add_argument("--platform", choices=("gpu", "cpu"), default=None,
+                        help="Device for agent inference (default: gpu)")
+    # Internal args used by spawn_workers for its children.
+    parser.add_argument("--run-dir", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--game-start", type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument("--no-progress", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
-    run_dir = Path(args.out) / f"collect-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    run_dir = (
+        Path(args.run_dir) if args.run_dir
+        else Path(args.out) / f"collect-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    )
+
+    if args.workers > 1:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        start = time.time()
+        ok = spawn_workers(args, run_dir)
+        elapsed = time.time() - start
+        total = args.games * args.steps
+        print(
+            f"{args.workers} workers: {total} steps in {elapsed:.0f}s "
+            f"-> {total / elapsed:.1f} steps/s aggregate"
+        )
+        print(f"Data written to: {run_dir}")
+        sys.exit(0 if ok else 1)
+
     mdp = build_mdp(args)
     # Agents are built once (checkpoint load + JIT warmup is expensive);
     # episode_start() fully resets their recurrent state between episodes.
@@ -262,19 +381,22 @@ def main():
         make_agent(mdp.env_info, 2, args.model2),
     )
 
-    for game in range(args.games):
+    for i in range(args.games):
+        game = args.game_start + i
         np.random.seed(args.seed + game)
-        if game > 0:
+        if i > 0:
             # score/faults persist on the env instance; rebuild per game.
             close_mdp(mdp)
             mdp = build_mdp(args)
         meta = collect_game(run_dir / f"game_{game:03d}", mdp, agent, args)
         print(
             f"game_{game:03d}: {meta['n_episodes']} episodes, "
-            f"score {meta['final_score']}, {meta['steps_per_s']} steps/s"
+            f"score {meta['final_score']}, {meta['steps_per_s']} steps/s",
+            flush=True,
         )
     close_mdp(mdp)
-    print(f"Data written to: {run_dir}")
+    if not args.run_dir:
+        print(f"Data written to: {run_dir}")
 
 
 if __name__ == "__main__":
