@@ -49,8 +49,8 @@ os.environ.setdefault("DRL_AIR_HOCKEY_JAX_PLATFORM", "gpu")
 os.environ.setdefault("DRL_AIR_HOCKEY_JAX_PREALLOC", "false")
 
 
-def _egl_device_for_cuda(cuda_index):
-    """Map an nvidia-smi/CUDA device index to mujoco's EGL device index.
+def _egl_cuda_devices():
+    """List (egl_index, cuda_index) for every GPU-backed EGL device.
 
     EGL enumerates devices in its own order (reversed relative to CUDA on
     some hosts, plus non-CUDA software devices), so MUJOCO_EGL_DEVICE_ID
@@ -75,11 +75,18 @@ def _egl_device_for_cuda(cuda_index):
     query_devices(0, None, ctypes.byref(count))
     devices = (device_t * count.value)()
     query_devices(count.value, devices, ctypes.byref(count))
+    found = []
     for i in range(count.value):
         attrib = attrib_t()
-        ok = query_attrib(devices[i], EGL_CUDA_DEVICE_NV, ctypes.byref(attrib))
-        if ok and attrib.value == cuda_index:
-            return i
+        if query_attrib(devices[i], EGL_CUDA_DEVICE_NV, ctypes.byref(attrib)):
+            found.append((i, attrib.value))
+    return found
+
+
+def _egl_device_for_cuda(cuda_index):
+    for egl_index, cuda in _egl_cuda_devices():
+        if cuda == cuda_index:
+            return egl_index
     raise RuntimeError(f"No EGL device maps to CUDA device {cuda_index}")
 
 
@@ -202,8 +209,10 @@ def open_video_writer(path, width, height, fps):
         ["ffmpeg", "-y", "-loglevel", "error",
          "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{width}x{height}",
          "-r", str(fps), "-i", "-",
+         # One encoder thread is ample at this resolution and keeps N
+         # parallel workers from spawning N * cores x264 threads.
          "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18",
-         "-preset", "fast", str(path)],
+         "-preset", "fast", "-threads", "1", str(path)],
         stdin=subprocess.PIPE,
     )
 
@@ -294,6 +303,16 @@ def collect_game(game_dir, mdp, agent, args):
 
 def spawn_workers(args, run_dir):
     """Split games across worker subprocesses writing into one run dir."""
+    # Spread the render contexts across all GPUs (unless the user pinned
+    # one): dozens of EGL contexts on a single card lose real throughput
+    # to GL context switching.
+    egl_devices = []
+    if args.gpu is None and "MUJOCO_EGL_DEVICE_ID" not in os.environ:
+        try:
+            egl_devices = [str(egl) for egl, _ in _egl_cuda_devices()]
+        except Exception:
+            pass
+
     base, extra = divmod(args.games, args.workers)
     procs = []
     game_start = 0
@@ -319,7 +338,12 @@ def spawn_workers(args, run_dir):
         env = dict(os.environ)
         # Keep each worker single-threaded so N workers don't oversubscribe
         # the box; MuJoCo physics dominates and is single-threaded anyway.
+        # XLA's CPU backend otherwise spins up an all-cores Eigen pool in
+        # every worker, and those pools thrash each other.
         env.setdefault("OMP_NUM_THREADS", "1")
+        env.setdefault("XLA_FLAGS", "--xla_cpu_multi_thread_eigen=false")
+        if egl_devices:
+            env["MUJOCO_EGL_DEVICE_ID"] = egl_devices[worker % len(egl_devices)]
         procs.append(subprocess.Popen(cmd, env=env))
         game_start += n_games
     return all(proc.wait() == 0 for proc in procs)
