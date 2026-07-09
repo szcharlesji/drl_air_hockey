@@ -176,9 +176,12 @@ def set_puck_radius(mdp, radius):
     puck_geom = model.geom("puck")
     scale = radius / puck_geom.size[0]
     puck_geom.size[0] = radius
-    # Collision culling uses the precompiled bounding radius; recompute it
-    # or an enlarged puck misses contacts.
+    # Collision culling uses the precompiled bounding radius AND per-geom
+    # AABB; without updating both, wall contacts engage only after deep
+    # penetration and the solver ejects the puck at hundreds of m/s.
     model.geom_rbound[puck_geom.id] = float(np.hypot(radius, puck_geom.size[1]))
+    model.geom_aabb[puck_geom.id][:3] = 0.0
+    model.geom_aabb[puck_geom.id][3:] = (radius, radius, puck_geom.size[1])
     body = model.body("puck")
     height = 2.0 * puck_geom.size[1]
     body.mass[0] *= scale**2
