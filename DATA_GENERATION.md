@@ -101,6 +101,40 @@ data_2023/collect-<timestamp>/game_000/
 The action taken *at* `image[k]` is `action[k+1]`. Episodes end on goal, fault
 (15 s one-side timer), or stuck-puck deadlock; episode lengths per game sum to `--steps`.
 
+## SA dataset pipeline (X/sa world model)
+
+One-shot build of the training set for the SA world model in
+`/home_shared/grail_charles/X/sa`. Runs 30 workers concurrently — 21 on
+aggressive-vs-aggressive, 9 on smooth_random-vs-smooth_random (70/30) — then
+converts everything collected so far into the `langtable_action_h5_v1` shard
+format that SA's `LanguageTableH5Dataset` reads (`dataset: languagetable`).
+
+```bash
+bash scripts/collect_sa_dataset.sh    # defaults: 105+45 games x 2000 steps, puck 0.07, cpu
+# every knob is an env var:
+STEPS=45000 GAMES_AGGR=21 GAMES_RAND=9 PUCK_RADIUS=0.03165 bash scripts/collect_sa_dataset.sh
+```
+
+- Raw 256px npz/mp4 masters accumulate in `~/data/raw_2023/{aggressive,random}`.
+  Re-running the script **adds** games (seed bases auto-advance past what
+  exists; random uses a disjoint 100000+ range) and rebuilds the H5 root.
+- H5 root `~/data/airhockey_sa_h5_v1`: `h5_manifest.json` (the loader never
+  globs shards) + `train|valid/shard_*.h5` holding
+  `/episodes/<key>/images (T,128,128,3) uint8` and `actions (T,4) float32` =
+  `[a1x, a1y, a2x, a2y]` commanded mallet xy in world frame. Alignment is
+  shifted from the npz convention to SA's: `images[t] = image[t]`,
+  `actions[t] = action[t+1]` (drives frame t -> t+1), final frame dropped.
+  The valid split holds out whole games per source. Converter:
+  `scripts/convert_npz_to_sa_h5.py` (standalone; see `--help`).
+- Train with the recipe `X/sa/configs/recipe-airhockey-v1.yaml`
+  (sketchy-v4 hyperparams, `action_dim: 4`, seq_len 20 dense windows):
+
+```bash
+cd /home_shared/grail_charles/X/sa
+python main.py --config configs/sa-episodic.py --recipe configs/recipe-airhockey-v1.yaml \
+    --wandb_project sa-airhockey --wandb_entity charlesji --wandb_run_name airhockey_v1
+```
+
 ## Running on different machines
 
 Device selection adapts per machine; the frames come out identical either way
