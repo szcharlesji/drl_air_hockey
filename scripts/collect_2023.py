@@ -77,6 +77,11 @@ def _default_jax_platform():
 
 
 os.environ.setdefault("DRL_AIR_HOCKEY_JAX_PLATFORM", _default_jax_platform())
+if os.environ["DRL_AIR_HOCKEY_JAX_PLATFORM"] == "cpu":
+    # Keep jax from even initializing its CUDA backend: routing computation
+    # to the CPU (jax_platform_name) alone still creates a CUDA context on
+    # every visible GPU — ~500 MB of VRAM per worker per GPU for nothing.
+    os.environ.setdefault("JAX_PLATFORMS", "cpu")
 # Two dreamerv3 Agent instances share this process; preallocating 75% of
 # VRAM per XLA client is unnecessary and hostile to a shared GPU.
 os.environ.setdefault("DRL_AIR_HOCKEY_JAX_PREALLOC", "false")
