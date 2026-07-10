@@ -42,11 +42,16 @@ python scripts/collect_2023.py --gpu 1 --games 1
 
 # Domain variation: resize the puck at runtime (no XML edits needed)
 python scripts/collect_2023.py --puck-radius 0.04 --games 4
+
+# Scripted smooth-random mallet motion (no checkpoints, no policy inference):
+# mallets wander their own halves and only incidentally touch the puck
+python scripts/collect_2023.py --workers 24 --platform cpu --games 24 \
+    --model1 smooth_random --model2 smooth_random
 ```
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--model1/--model2` | `tournament_balanced` | agent checkpoints (or `baseline`) |
+| `--model1/--model2` | `tournament_balanced` | agent checkpoints, `baseline`, or `smooth_random` |
 | `--games` | 1 | number of games |
 | `--steps` | 45000 | env steps per game (50 Hz) |
 | `--out` | `data_2023` | output root |
@@ -59,6 +64,19 @@ python scripts/collect_2023.py --puck-radius 0.04 --games 4
 | `--seed` | 0 | per-game seed = `seed + game_index` |
 | `--keep-scoreboard` | off | bake the score overlay into frames |
 | `--fps` | 50 | verification-video framerate |
+
+## The `smooth_random` policy
+
+`smooth_random` (`drl_air_hockey/agents/smooth_random_agent.py`) replaces the
+RL checkpoint with a scripted wanderer: random waypoints inside the same
+operating box the RL agents use, tracked by a critically damped spring in
+mallet-xy space, with per-episode randomized speeds, pauses, and occasional
+fast strokes (~1.5–3 m/s). Joint commands come from warm-started IK, so the
+recorded `action` channel *is* this smooth xy trajectory. With both sides
+random, the puck mostly idles, so most episodes end via the 15 s fault timer
+(~750 steps) or the stuck-puck guard — many short episodes per game is
+expected and useful (the puck re-randomizes every episode). Tunables live in
+`MOTION_PARAMS` at the top of the agent file.
 
 ## Output layout
 

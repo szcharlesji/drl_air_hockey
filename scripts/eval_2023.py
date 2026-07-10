@@ -20,6 +20,7 @@ from air_hockey_challenge.utils.tournament_agent_wrapper import (
 from baseline.baseline_agent.baseline_agent import BaselineAgent
 
 import drl_air_hockey.agents.single_strategy_agent as ssa
+from drl_air_hockey.agents.smooth_random_agent import SmoothRandomAgent
 from drl_air_hockey.utils.config import DIR_MODELS
 from drl_air_hockey.utils.tournament_agent_strategies import strategy_from_str
 
@@ -29,12 +30,15 @@ MODELS = (
     "tournament_defensive",
     "tournament_balanced_no_selfplay",
     "baseline",
+    "smooth_random",
 )
 
 
 def make_agent(env_info, agent_id, model):
     if model == "baseline":
         return BaselineAgent(env_info, agent_id)
+    if model == "smooth_random":
+        return SmoothRandomAgent(env_info, agent_id)
     # SingleStrategySpaceRAgent hardcodes BalancedAgentStrategy for its
     # action-scheme kwargs (velocity scaling, operating area). Swap in the
     # strategy matching the checkpoint before construction.
