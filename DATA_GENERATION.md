@@ -73,7 +73,8 @@ data_2023/collect-<timestamp>/game_000/
 | Key | Shape / dtype | Notes |
 |---|---|---|
 | `image` | (T+1, H, W, 3) uint8 | `image[0]` = post-reset frame |
-| `action` | (T+1, 2, 2, 7) float32 | `action[k]` led into state k; `action[0]` = zeros. Axes: (agent, pos/vel, joint) |
+| `action` | (T+1, 2, 2) float32 | commanded mallet x,y in world frame (FK of the joint command); `action[k]` led into state k; `action[0]` = zeros. Axes: (agent, xy) |
+| `action_joints` | (T+1, 2, 2, 7) float32 | raw joint-space command behind `action[k]`. Axes: (agent, pos/vel, joint) |
 | `obs` | (T+1, 46) float32 | raw low-dim env observation |
 | `is_first / is_last / is_terminal` | (T+1,) bool | `is_terminal[-1]` False only when truncated by `--steps` |
 | `score / faults` | (T+1, 2) int32 | running counters |

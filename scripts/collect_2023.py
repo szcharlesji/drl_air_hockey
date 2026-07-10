@@ -8,13 +8,19 @@ Replaces the two-phase eval_2023.py -> replay_2023.py flow for data
 collection: no dataset.pkl, no re-rendering, no per-step logging overhead.
 
 Episode file layout (DreamerV3 obs-first convention; T actions, T+1 states):
-    image       uint8   (T+1, H, W, 3)  image[k] is the frame of state s_k;
-                                        image[0] is the post-reset frame
-    action      float32 (T+1, 2, 2, 7)  action[k] led into s_k, i.e. the
-                                        action taken *at* image[k] is
-                                        action[k+1]; action[0] is zeros.
-                                        Axes: (agent, [pos|vel], joint)
-    obs         float32 (T+1, 46)       raw low-dim env observation of s_k
+    image         uint8   (T+1, H, W, 3)  image[k] is the frame of state s_k;
+                                          image[0] is the post-reset frame
+    action        float32 (T+1, 2, 2)     commanded mallet x,y in WORLD frame
+                                          (same frame the camera sees), from
+                                          forward kinematics of the commanded
+                                          joint positions. action[k] led into
+                                          s_k, i.e. the action taken *at*
+                                          image[k] is action[k+1]; action[0]
+                                          is zeros. Axes: (agent, xy)
+    action_joints float32 (T+1, 2, 2, 7)  the raw joint-space command behind
+                                          action[k]. Axes: (agent, [pos|vel],
+                                          joint)
+    obs           float32 (T+1, 46)       raw low-dim env observation of s_k
     is_first    bool    (T+1,)          True only at index 0
     is_last     bool    (T+1,)          True only at index -1
     is_terminal bool    (T+1,)          is_last AND the episode ended in an
@@ -30,6 +36,7 @@ Examples:
     python scripts/collect_2023.py --workers 16 --platform cpu --games 16
 """
 import os
+import subprocess
 import sys
 
 # Must be set before mujoco / drl_air_hockey imports. EGL renders headless on
@@ -43,7 +50,31 @@ if "--platform" in sys.argv[:-1]:
     os.environ.setdefault(
         "DRL_AIR_HOCKEY_JAX_PLATFORM", sys.argv[sys.argv.index("--platform") + 1]
     )
-os.environ.setdefault("DRL_AIR_HOCKEY_JAX_PLATFORM", "gpu")
+
+
+def _default_jax_platform():
+    """GPU when jaxlib can actually target it, else CPU.
+
+    The pinned jaxlib 0.4.23 cannot generate code for GPUs newer than
+    Hopper (e.g. RTX 5090 / Blackwell, compute capability 12.x) — XLA
+    falls back to sm_90a PTX and ptxas aborts the process. EGL rendering
+    is unaffected either way.
+    """
+    try:
+        caps = subprocess.run(
+            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10, check=True,
+        ).stdout.split()
+        if caps and all(float(cap) <= 9.0 for cap in caps):
+            return "gpu"
+        print("collect_2023: GPU compute capability unsupported by the pinned "
+              "jaxlib; running inference on CPU (rendering stays on GPU)")
+    except Exception:
+        pass
+    return "cpu"
+
+
+os.environ.setdefault("DRL_AIR_HOCKEY_JAX_PLATFORM", _default_jax_platform())
 # Two dreamerv3 Agent instances share this process; preallocating 75% of
 # VRAM per XLA client is unnecessary and hostile to a shared GPU.
 os.environ.setdefault("DRL_AIR_HOCKEY_JAX_PREALLOC", "false")
@@ -113,6 +144,7 @@ from pathlib import Path
 import mujoco
 import numpy as np
 from air_hockey_challenge.framework import AirHockeyChallengeWrapper
+from air_hockey_challenge.utils.kinematics import forward_kinematics
 from air_hockey_challenge.utils.tournament_agent_wrapper import (
     SimpleTournamentAgentWrapper,
 )
@@ -127,20 +159,22 @@ class EpisodeBuffer:
     def __init__(self, frame, obs, score, faults):
         self.images = [frame]
         self.obs = [obs]
-        self.actions = [np.zeros((2, 2, 7), dtype=np.float32)]
+        self.actions_xy = [np.zeros((2, 2), dtype=np.float32)]
+        self.actions_joints = [np.zeros((2, 2, 7), dtype=np.float32)]
         self.scores = [score]
         self.faults = [faults]
 
-    def append(self, frame, obs, action, score, faults):
+    def append(self, frame, obs, action_xy, action_joints, score, faults):
         self.images.append(frame)
         self.obs.append(obs)
-        self.actions.append(action)
+        self.actions_xy.append(action_xy)
+        self.actions_joints.append(action_joints)
         self.scores.append(score)
         self.faults.append(faults)
 
     @property
     def n_actions(self):
-        return len(self.actions) - 1
+        return len(self.actions_xy) - 1
 
     def save(self, path, terminal):
         n = len(self.images)
@@ -153,7 +187,8 @@ class EpisodeBuffer:
         np.savez_compressed(
             path,
             image=np.stack(self.images),
-            action=np.stack(self.actions).astype(np.float32),
+            action=np.stack(self.actions_xy).astype(np.float32),
+            action_joints=np.stack(self.actions_joints).astype(np.float32),
             obs=np.stack(self.obs).astype(np.float32),
             is_first=is_first,
             is_last=is_last,
@@ -161,6 +196,24 @@ class EpisodeBuffer:
             score=np.asarray(self.scores, dtype=np.int32),
             faults=np.asarray(self.faults, dtype=np.int32),
         )
+
+
+def make_command_to_xy(env_info):
+    """Map a joint-position command to the commanded mallet x,y (world frame).
+
+    Forward kinematics of the commanded joints gives the mallet target in the
+    robot's base frame; the base transform brings both agents into the one
+    world frame the camera sees (agent 2's own frame is rotated 180 degrees).
+    """
+    robot_model = env_info["robot"]["robot_model"]
+    robot_data = env_info["robot"]["robot_data"]
+    base_frames = env_info["robot"]["base_frame"]
+
+    def command_to_xy(joint_pos_cmd, agent_idx):
+        pos, _ = forward_kinematics(robot_model, robot_data, joint_pos_cmd)
+        return (base_frames[agent_idx] @ np.append(pos, 1.0))[:2]
+
+    return command_to_xy
 
 
 def set_puck_radius(mdp, radius):
@@ -292,6 +345,8 @@ def collect_game(game_dir, mdp, agent, args):
     saves = []
     start = time.time()
 
+    command_to_xy = make_command_to_xy(mdp.env_info)
+
     # Both agent types have empty preprocessor lists, so Core._preprocess is
     # skipped here; revisit if agents ever register preprocessors.
     state, buffer = reset_episode(mdp, agent, video)
@@ -304,6 +359,7 @@ def collect_game(game_dir, mdp, agent, args):
         buffer.append(
             frame,
             obs,
+            np.stack([command_to_xy(action_1[0], 0), command_to_xy(action_2[0], 1)]),
             np.stack([action_1, action_2]),
             list(info["score"]),
             list(info["faults"]),
