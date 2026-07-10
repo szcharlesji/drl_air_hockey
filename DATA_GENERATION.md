@@ -52,8 +52,9 @@ python scripts/collect_2023.py --puck-radius 0.04 --games 4
 | `--out` | `data_2023` | output root |
 | `--width/--height` | 256/256 | frame size |
 | `--workers` | 1 | parallel collector processes |
-| `--platform` | `gpu` | inference device (`cpu` for worker fleets) |
+| `--platform` | auto | `cpu` = fully GPU-free: CPU inference AND software (llvmpipe) rendering |
 | `--gpu` | — | pin CUDA + EGL to one nvidia-smi device |
+| `--shadows` | off | render shadows/reflections (off so frames match across GPU/CPU renderers) |
 | `--puck-radius` | 0.03165 | puck radius in m (collision + visuals + mass/inertia) |
 | `--seed` | 0 | per-game seed = `seed + game_index` |
 | `--keep-scoreboard` | off | bake the score overlay into frames |
@@ -81,6 +82,21 @@ data_2023/collect-<timestamp>/game_000/
 
 The action taken *at* `image[k]` is `action[k+1]`. Episodes end on goal, fault
 (15 s one-side timer), or stuck-puck deadlock; episode lengths per game sum to `--steps`.
+
+## Running on different machines
+
+Device selection adapts per machine; the frames come out identical either way
+(shadows/reflections are disabled by default for exactly this reason):
+
+- **default (no flags)**: inference on GPU if the pinned jaxlib 0.4.23 can
+  target it (Ampere/Ada/Hopper, compute capability <= 9.0 — e.g. A6000 yes,
+  RTX 5090/Blackwell no; auto-detected via nvidia-smi, falls back to CPU
+  inference with GPU rendering). Rendering always on GPU via EGL.
+- **`--platform cpu`**: nothing touches the GPUs — CPU inference plus Mesa
+  llvmpipe software rendering (~16 ms/frame at 256px, `LP_NUM_THREADS=2`).
+- **`--gpu N`**: pin both CUDA inference and EGL rendering to nvidia-smi
+  device N (EGL index resolved via `EGL_CUDA_DEVICE_NV`, since EGL device
+  order is machine-specific).
 
 ## Rendered scene (env repo, `data-collection` branch)
 

@@ -46,10 +46,12 @@ import sys
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 # --platform must take effect before jax initializes, i.e. before argparse.
+# An EXPLICIT cpu request (flag or env var) additionally moves rendering off
+# the GPUs (see below); the automatic fallback for unsupported GPUs does not.
+_requested_platform = os.environ.get("DRL_AIR_HOCKEY_JAX_PLATFORM")
 if "--platform" in sys.argv[:-1]:
-    os.environ.setdefault(
-        "DRL_AIR_HOCKEY_JAX_PLATFORM", sys.argv[sys.argv.index("--platform") + 1]
-    )
+    _requested_platform = _requested_platform or sys.argv[sys.argv.index("--platform") + 1]
+    os.environ.setdefault("DRL_AIR_HOCKEY_JAX_PLATFORM", _requested_platform)
 
 
 def _default_jax_platform():
@@ -121,6 +123,32 @@ def _egl_device_for_cuda(cuda_index):
     raise RuntimeError(f"No EGL device maps to CUDA device {cuda_index}")
 
 
+def _egl_software_device():
+    """EGL index of Mesa's software rasterizer (llvmpipe), or None."""
+    import ctypes
+
+    from OpenGL import EGL
+
+    device_t = ctypes.c_void_p
+    EGL_EXTENSIONS = 0x3055
+    query_devices = ctypes.CFUNCTYPE(
+        ctypes.c_uint, ctypes.c_int, ctypes.POINTER(device_t),
+        ctypes.POINTER(ctypes.c_int),
+    )(EGL.eglGetProcAddress("eglQueryDevicesEXT"))
+    query_string = ctypes.CFUNCTYPE(
+        ctypes.c_char_p, device_t, ctypes.c_int
+    )(EGL.eglGetProcAddress("eglQueryDeviceStringEXT"))
+    count = ctypes.c_int()
+    query_devices(0, None, ctypes.byref(count))
+    devices = (device_t * count.value)()
+    query_devices(count.value, devices, ctypes.byref(count))
+    for i in range(count.value):
+        extensions = query_string(devices[i], EGL_EXTENSIONS)
+        if extensions and b"software" in extensions:
+            return i
+    return None
+
+
 # --gpu pins BOTH inference (CUDA) and rendering (EGL) to one nvidia-smi
 # device. It must take effect before jax/mujoco initialize, hence this early
 # argv scan instead of argparse (which runs after the imports below).
@@ -132,6 +160,20 @@ if "--gpu" in sys.argv[:-1]:
     # so setting CUDA_VISIBLE_DEVICES first would renumber them.
     os.environ.setdefault("MUJOCO_EGL_DEVICE_ID", str(_egl_device_for_cuda(int(_gpu))))
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", _gpu)
+
+# An EXPLICIT --platform cpu means: leave the GPUs alone entirely. Inference
+# runs on CPU via the env var above; rendering goes to Mesa's software EGL
+# device (llvmpipe). The automatic CPU fallback for jaxlib-unsupported GPUs
+# keeps rendering on the GPU, which works fine there.
+if (_requested_platform == "cpu" and "--gpu" not in sys.argv
+        and "MUJOCO_EGL_DEVICE_ID" not in os.environ):
+    _soft = _egl_software_device()
+    if _soft is not None:
+        os.environ["MUJOCO_EGL_DEVICE_ID"] = str(_soft)
+        # llvmpipe saturates around 2-4 threads at 256px with shadows off.
+        os.environ.setdefault("LP_NUM_THREADS", "2")
+    else:
+        print("collect_2023: no software EGL device found; rendering stays on GPU")
 
 import argparse
 import json
@@ -322,11 +364,20 @@ def open_video_writer(path, width, height, fps):
     )
 
 
-def reset_episode(mdp, agent, video):
+def reset_episode(mdp, agent, video, shadows):
     """Core.reset() semantics: episode_start before env reset."""
     agent.episode_start()
     state = mdp.reset()
     frame = mdp.render(record=True)
+    viewer = mdp.base_env._viewer
+    if not shadows and viewer._scene.flags[mujoco.mjtRndFlag.mjRND_SHADOW]:
+        # Off by default: llvmpipe (--platform cpu rendering) is ~6x slower
+        # with shadow maps, and frames must look the same regardless of
+        # which machine/renderer produced them. The viewer is created
+        # lazily by the render() above, hence flag-flip + one re-render.
+        viewer._scene.flags[mujoco.mjtRndFlag.mjRND_SHADOW] = 0
+        viewer._scene.flags[mujoco.mjtRndFlag.mjRND_REFLECTION] = 0
+        frame = mdp.render(record=True)
     video.stdin.write(frame.tobytes())
     buffer = EpisodeBuffer(
         frame, state, list(mdp.base_env.score), list(mdp.base_env.faults)
@@ -349,7 +400,7 @@ def collect_game(game_dir, mdp, agent, args):
 
     # Both agent types have empty preprocessor lists, so Core._preprocess is
     # skipped here; revisit if agents ever register preprocessors.
-    state, buffer = reset_episode(mdp, agent, video)
+    state, buffer = reset_episode(mdp, agent, video, args.shadows)
     for _ in tqdm(range(args.steps), desc=game_dir.name, unit="step",
                   disable=args.no_progress):
         action_1, action_2, _, _ = agent.draw_action(state)
@@ -370,7 +421,7 @@ def collect_game(game_dir, mdp, agent, args):
                 buffer.save, game_dir / f"episode_{len(episode_lengths):03d}.npz", True
             ))
             episode_lengths.append(buffer.n_actions)
-            state, buffer = reset_episode(mdp, agent, video)
+            state, buffer = reset_episode(mdp, agent, video, args.shadows)
 
     # Budget exhausted: save the truncated tail unless the last step was
     # absorbing, which leaves only a fresh post-reset state in the buffer.
@@ -402,6 +453,7 @@ def collect_game(game_dir, mdp, agent, args):
         "height": args.height,
         "fps": args.fps,
         "puck_radius": args.puck_radius,
+        "shadows": args.shadows,
         "jax_backend": jax.default_backend(),
         "wall_time_s": round(elapsed, 1),
         "steps_per_s": round(args.steps / elapsed, 1),
@@ -440,6 +492,8 @@ def spawn_workers(args, run_dir):
         ]
         if args.keep_scoreboard:
             cmd.append("--keep-scoreboard")
+        if args.shadows:
+            cmd.append("--shadows")
         if args.puck_radius is not None:
             cmd += ["--puck-radius", str(args.puck_radius)]
         if args.platform:
@@ -473,6 +527,9 @@ def main():
     parser.add_argument("--fps", type=int, default=50, help="Video fps (env runs at 50 Hz)")
     parser.add_argument("--keep-scoreboard", action="store_true",
                         help="Keep the scoreboard overlay baked into the frames")
+    parser.add_argument("--shadows", action="store_true",
+                        help="Render shadows and reflections (off by default "
+                             "so frames match across GPU and CPU renderers)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--puck-radius", type=float, default=None,
                         help="Puck radius in meters (model default: 0.03165); "
