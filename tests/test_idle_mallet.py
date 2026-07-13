@@ -23,27 +23,31 @@ class _FakeAgent:
         self.reset_calls += 1
 
 
-def test_idle_mallet_holds_for_a_random_finite_pause_and_advances_policy(monkeypatch):
+def test_idle_mallet_holds_a_safe_policy_target_without_advancing_policy(monkeypatch):
     agent = _FakeAgent()
     wrapper = IdleMalletAgent(
         agent, idle_probability=0.5, idle_min_steps=2, idle_max_steps=2
     )
     wrapper.episode_start()
-    random_draws = iter((0.0, 1.0))  # start first pause, then resume
+    random_draws = iter((1.0, 0.0, 1.0))  # move, pause, then resume
     monkeypatch.setattr(np.random, "random", lambda: next(random_draws))
     monkeypatch.setattr(np.random, "randint", lambda low, high: 2)
 
     first_obs = np.array([9.0, 1.0, 9.0, 2.0, 3.0])
     second_obs = np.array([9.0, 4.0, 9.0, 5.0, 6.0])
     third_obs = np.array([9.0, 7.0, 9.0, 8.0, 9.0])
+    fourth_obs = np.array([9.0, 10.0, 9.0, 11.0, 12.0])
     np.testing.assert_array_equal(
-        wrapper.draw_action(first_obs), np.array([[1.0, 2.0, 3.0], [0.0, 0.0, 0.0]])
+        wrapper.draw_action(first_obs), np.full((2, 3), 1.0)
     )
     np.testing.assert_array_equal(
-        wrapper.draw_action(second_obs), np.array([[1.0, 2.0, 3.0], [0.0, 0.0, 0.0]])
+        wrapper.draw_action(second_obs), np.array([[1.0, 1.0, 1.0], [0.0, 0.0, 0.0]])
     )
     np.testing.assert_array_equal(
-        wrapper.draw_action(third_obs), np.full((2, 3), 3.0)
+        wrapper.draw_action(third_obs), np.array([[1.0, 1.0, 1.0], [0.0, 0.0, 0.0]])
+    )
+    np.testing.assert_array_equal(
+        wrapper.draw_action(fourth_obs), np.full((2, 3), 2.0)
     )
     assert not wrapper.is_idle
     assert wrapper.pause_stats == {
@@ -51,7 +55,7 @@ def test_idle_mallet_holds_for_a_random_finite_pause_and_advances_policy(monkeyp
         "paused_steps": 2,
         "currently_paused": False,
     }
-    assert agent.draw_calls == 3
+    assert agent.draw_calls == 2
     assert agent.episode_start_calls == 1
 
 

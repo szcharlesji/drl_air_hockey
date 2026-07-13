@@ -66,12 +66,13 @@ python scripts/collect_2023.py --workers 24 --platform cpu --games 24 \
 | `--gpu` | — | pin CUDA + EGL to one nvidia-smi device |
 | `--shadows` | off | render shadows/reflections (off so frames match across GPU/CPU renderers) |
 | `--puck-radius` | 0.03165 | puck radius in m (collision + visuals + mass/inertia); the physical/scored/rendered goal mouth stays 0.1867 m wider than the puck diameter |
-| `--mallet-radius` | 0.04815 | physical IIWA mallet radius (collision, visual mallet, policy bounds, and tournament reset range) |
+| `--mallet-radius` | 0.04815 | physical IIWA mallet radius (collision, radial-only foam visual scale, policy bounds, and tournament reset range) |
 | `--robot-visual-scale` | 1.0 | visual-only IIWA arm-mesh scale; physics and actions are unchanged |
 | `--orientation-marker-arm-length` / `--orientation-marker-stroke-width` | 0.08 / 0.024 m | absolute dimensions of the puck's asymmetric red cross, independent of puck size |
 | `--idle-prob1` / `--idle-prob2` | 0 | independent per-unpaused-step probability each mallet starts a random pause |
 | `--idle-min-steps` / `--idle-max-steps` | 5 / 25 | inclusive random pause duration (0.10--0.50 s at 50 Hz) |
 | `--post-goal-policy` | `smooth_random` | both players use smooth-random actions after a real goal |
+| `--mallet-level-lock` | `hard_level_height_projection` | mandatory level/height safety projection for both mallets |
 | `--seed` | 0 | per-game seed = `seed + game_index` |
 | `--keep-scoreboard` | off | bake the score overlay into frames |
 | `--fps` | 50 | verification-video framerate |
@@ -93,13 +94,19 @@ Tunables live in `MOTION_PARAMS` at the top of the agent file.
 
 `--idle-prob1` and `--idle-prob2` wrap any policy (including tournament
 policies and `smooth_random`) independently. On each unpaused control step,
-they can start a uniformly random 5--25-frame hold of the measured current
-joint pose with zero velocity; the wrapped policy still advances internally.
+they can start a uniformly random 5--25-frame hold of the last issued,
+IK-valid joint target with zero velocity. The policy is frozen during the
+hold, then resumes from the actual robot state, avoiding a stale-command jump.
 The v6 value is `0.005`, roughly one onset per four seconds of active time.
 This naturally yields one-player and two-player pauses without a coordinator.
 After a real goal, both players switch to fresh `smooth_random` policies for
 the hidden-puck tail so an aggressive policy does not produce out-of-context
 motions.
+
+The collector hard-projects mallet level and striker height at every simulation
+boundary. Mallets therefore stay level and table-safe in both physics and
+frames; their enlarged foam visuals scale only radially, never downward
+through the table.
 
 ## Output layout
 

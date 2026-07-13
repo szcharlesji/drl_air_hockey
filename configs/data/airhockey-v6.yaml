@@ -32,6 +32,8 @@ collection:
     idle_max_steps: 25
     # Both players switch to smooth_random after the first real goal.
     post_goal_policy: smooth_random
+    # Force both passive mallets level and at the policy's table height.
+    mallet_level_lock: hard_level_height_projection
 
 sources:
   - name: aggressive

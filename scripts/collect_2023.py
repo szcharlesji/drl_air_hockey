@@ -719,6 +719,23 @@ def set_goal_opening_for_puck(mdp):
     return goal_width
 
 
+def _scale_mallet_mesh_radially(vertices, scale, axial_direction):
+    """Increase a foam mallet's radial footprint without changing its height."""
+    center = vertices.mean(axis=0)
+    axis = np.asarray(axial_direction, dtype=float)
+    if axis.shape != (3,) or not np.all(np.isfinite(axis)):
+        raise ValueError("axial_direction must be one finite 3-vector")
+    norm = np.linalg.norm(axis)
+    if norm == 0.0:
+        raise ValueError("axial_direction must be nonzero")
+    axis = axis / norm
+    # The foam asset uses a different authored axis convention than the
+    # cylinder. Preserve displacement along the cylinder axis and scale only
+    # the plane perpendicular to it, irrespective of mesh coordinates.
+    radial_scale = scale * np.eye(3) + (1.0 - scale) * np.outer(axis, axis)
+    vertices[:] = center + (vertices - center) @ radial_scale.T
+
+
 def set_mallet_radius(mdp, radius):
     """Resize the physical IIWA mallets and keep policy-facing bounds aligned.
 
@@ -737,7 +754,11 @@ def set_mallet_radius(mdp, radius):
     if np.isclose(radius, old_radius):
         return
     scale = radius / old_radius
-    mallet_mesh_ids = set()
+    mallet_mesh_axes = {}
+    # Resolve the cylinder axis in each foam mesh's own coordinates. The
+    # model's dynamic poses are valid here and the relative direction is
+    # invariant under later robot motion.
+    mujoco.mj_fwdPosition(model, base_env._data)
 
     for agent_idx in (1, 2):
         geom = model.geom(f"iiwa_{agent_idx}/ee")
@@ -771,8 +792,10 @@ def set_mallet_radius(mdp, radius):
                 geom.size[1],
             )
 
-        # Find the visual foam mesh on the same body and scale it to match
-        # the real collider.  It is shared by both robots, hence the set.
+        # Find the visual foam mesh on the same body and scale its horizontal
+        # footprint to match the real collider. It is shared by both robots,
+        # hence the set.
+        collider_axis_world = base_env._data.geom_xmat[geom.id].reshape(3, 3)[:, 2]
         for geom_id in range(model.ngeom):
             if (
                 model.geom_bodyid[geom_id] == body.id
@@ -780,7 +803,14 @@ def set_mallet_radius(mdp, radius):
                 and model.geom_contype[geom_id] == 0
                 and model.geom_conaffinity[geom_id] == 0
             ):
-                mallet_mesh_ids.add(model.geom_dataid[geom_id])
+                mesh_id = model.geom_dataid[geom_id]
+                mesh_rotation = base_env._data.geom_xmat[geom_id].reshape(3, 3)
+                axis_in_mesh = mesh_rotation.T @ collider_axis_world
+                previous_axis = mallet_mesh_axes.setdefault(mesh_id, axis_in_mesh)
+                if not np.isclose(abs(np.dot(previous_axis, axis_in_mesh)), 1.0, atol=1e-6):
+                    raise RuntimeError(
+                        "shared mallet foam mesh has incompatible cylinder axes"
+                    )
 
         # A defensive assertion catches a future XML change where the visual
         # and physical mallet no longer share their intended nominal radius.
@@ -790,12 +820,15 @@ def set_mallet_radius(mdp, radius):
                 f"env_info mallet radius {old_radius}"
             )
 
-    for mesh_id in mallet_mesh_ids:
+    for mesh_id, axis_in_mesh in mallet_mesh_axes.items():
         start = model.mesh_vertadr[mesh_id]
         end = start + model.mesh_vertnum[mesh_id]
         vertices = model.mesh_vert[start:end]
-        center = vertices.mean(axis=0)
-        vertices[:] = center + scale * (vertices - center)
+        # The physical cylinder keeps its authored height when only its
+        # radius changes. Match that geometry: enlarge the foam footprint in
+        # its local XY plane, but preserve Z so the visual mallet stays flush
+        # with the table instead of visibly growing through it.
+        _scale_mallet_mesh_radially(vertices, scale, axis_in_mesh)
 
     # The policy constructors run after build_mdp(), so this makes their
     # operating boxes match the enlarged real collider.  Keep the tournament
@@ -854,6 +887,228 @@ def set_robot_visual_scale(mdp, scale):
         vertices[:] = center + scale * (vertices - center)
 
 
+MALLET_DOWN_WORLD = np.array((0.0, 0.0, -1.0))
+
+
+def _solve_universal_level_angles(down_in_link_frame):
+    """Solve the two passive striker joints that make the mallet level.
+
+    The XML declares the joints in local-y then local-x order.  For a desired
+    downward mallet normal ``d`` expressed in the striker-link frame,
+    ``R_y(q1) R_x(q2) [0, 0, 1] == d``.  The tournament's stock plugin only
+    PD-controls an approximation to this target; direct projection is needed
+    because the mallet/table collision pair is intentionally disabled.
+    """
+    down = np.asarray(down_in_link_frame, dtype=float)
+    if down.shape != (3,) or not np.all(np.isfinite(down)):
+        raise ValueError("down_in_link_frame must be one finite 3-vector")
+    norm = np.linalg.norm(down)
+    if norm == 0.0:
+        raise ValueError("down_in_link_frame must be nonzero")
+    down = down / norm
+    return np.array(
+        (
+            np.arctan2(down[0], down[2]),
+            -np.arcsin(np.clip(down[1], -1.0, 1.0)),
+        )
+    )
+
+
+class HardMalletLevelGuard:
+    """Keep the passive IIWA striker joints exactly level during collection.
+
+    Air Hockey Challenge normally drives these two universal joints with a
+    weak PD plugin.  Under abrupt commands it can lag, letting a visual (and
+    puck-contact) mallet tilt through the table because that collision pair is
+    disabled.  This collector-local guard projects both joints at every 1 ms
+    simulation boundary without touching the seven controlled arm joints or
+    their recorded action labels.
+    """
+
+    def __init__(self, mdp):
+        self.mdp = mdp
+        self.base_env = mdp.base_env
+        self.model = self.base_env._model
+        self.data = self.base_env._data
+        self._link_body_ids = []
+        self._base_body_ids = []
+        self._qpos_addrs = []
+        self._dof_addrs = []
+        self._actuator_ids = []
+        self._joint_ranges = []
+        self._arm_qpos_addrs = []
+        self._arm_dof_addrs = []
+        self._arm_joint_ranges = []
+        for agent_idx in (1, 2):
+            self._link_body_ids.append(
+                self.model.body(f"iiwa_{agent_idx}/striker_joint_link").id
+            )
+            self._base_body_ids.append(self.model.body(f"iiwa_{agent_idx}/base").id)
+            arm_qpos_addrs, arm_dof_addrs, arm_joint_ranges = [], [], []
+            for joint_idx in range(1, 8):
+                joint = self.model.joint(f"iiwa_{agent_idx}/joint_{joint_idx}")
+                arm_qpos_addrs.append(int(self.model.jnt_qposadr[joint.id]))
+                arm_dof_addrs.append(int(self.model.jnt_dofadr[joint.id]))
+                arm_joint_ranges.append(self.model.jnt_range[joint.id].copy())
+            self._arm_qpos_addrs.append(arm_qpos_addrs)
+            self._arm_dof_addrs.append(arm_dof_addrs)
+            self._arm_joint_ranges.append(arm_joint_ranges)
+            for joint_idx in (1, 2):
+                joint = self.model.joint(
+                    f"iiwa_{agent_idx}/striker_joint_{joint_idx}"
+                )
+                self._qpos_addrs.append(int(self.model.jnt_qposadr[joint.id]))
+                self._dof_addrs.append(int(self.model.jnt_dofadr[joint.id]))
+                self._joint_ranges.append(self.model.jnt_range[joint.id].copy())
+                self._actuator_ids.append(
+                    self.model.actuator(
+                        f"iiwa_{agent_idx}/striker_joint_{joint_idx}"
+                    ).id
+                )
+        self._qpos_addrs = np.asarray(self._qpos_addrs, dtype=int)
+        self._dof_addrs = np.asarray(self._dof_addrs, dtype=int)
+        self._actuator_ids = np.asarray(self._actuator_ids, dtype=int)
+        self._joint_ranges = np.asarray(self._joint_ranges, dtype=float)
+        self._arm_qpos_addrs = np.asarray(self._arm_qpos_addrs, dtype=int)
+        self._arm_dof_addrs = np.asarray(self._arm_dof_addrs, dtype=int)
+        self._arm_joint_ranges = np.asarray(self._arm_joint_ranges, dtype=float)
+        self._ee_desired_height = float(mdp.env_info["robot"]["ee_desired_height"])
+        self._installed = False
+
+    def _project_arm_height(self):
+        """Restore each striker-link height while preserving its live XY."""
+        jac_pos = np.empty((3, self.model.nv))
+        jac_rot = np.empty((3, self.model.nv))
+        for agent_idx, (base_body_id, link_body_id) in enumerate(
+            zip(self._base_body_ids, self._link_body_ids)
+        ):
+            target = self.data.xpos[link_body_id].copy()
+            target[2] = self.data.xpos[base_body_id, 2] + self._ee_desired_height
+            qpos_addrs = self._arm_qpos_addrs[agent_idx]
+            dof_addrs = self._arm_dof_addrs[agent_idx]
+            lower = self._arm_joint_ranges[agent_idx, :, 0]
+            upper = self._arm_joint_ranges[agent_idx, :, 1]
+            # A small damped least-squares projection avoids changing the
+            # current XY endpoint while recovering the policy's fixed height.
+            for _ in range(6):
+                current = self.data.xpos[link_body_id]
+                error = target - current
+                if np.linalg.norm(error) <= 1e-5:
+                    break
+                mujoco.mj_jacBody(self.model, self.data, jac_pos, jac_rot, link_body_id)
+                jacobian = jac_pos[:, dof_addrs]
+                delta = jacobian.T @ np.linalg.solve(
+                    jacobian @ jacobian.T + 1e-6 * np.eye(3), error
+                )
+                delta_norm = np.linalg.norm(delta)
+                if delta_norm > 0.1:
+                    delta *= 0.1 / delta_norm
+                current_qpos = self.data.qpos[qpos_addrs]
+                next_qpos = np.clip(current_qpos + delta, lower, upper)
+                if np.array_equal(next_qpos, current_qpos):
+                    break
+                self.data.qpos[qpos_addrs] = next_qpos
+                mujoco.mj_fwdPosition(self.model, self.data)
+
+            height_error = target[2] - self.data.xpos[link_body_id, 2]
+            if abs(height_error) > 1e-4:
+                raise RuntimeError(
+                    f"cannot restore iiwa_{agent_idx + 1} mallet height: "
+                    f"error={height_error:.6f} m"
+                )
+            # Remove only the arm velocity component that would immediately
+            # reintroduce vertical motion. This leaves horizontal play intact.
+            mujoco.mj_jacBody(self.model, self.data, jac_pos, jac_rot, link_body_id)
+            jacobian_z = jac_pos[2, dof_addrs]
+            denominator = jacobian_z @ jacobian_z + 1e-6
+            arm_velocity = self.data.qvel[dof_addrs]
+            self.data.qvel[dof_addrs] = (
+                arm_velocity
+                - jacobian_z * (jacobian_z @ arm_velocity) / denominator
+            )
+
+    def project(self, refresh_kinematics=True, project_height=True):
+        """Hard-set safe arm height and passive mallet orientation."""
+        # ``mj_step`` can leave derived body transforms from the preceding
+        # integration phase. Refresh before solving so the parent rod pose is
+        # current; otherwise one projection can lag a moving arm slightly.
+        mujoco.mj_fwdPosition(self.model, self.data)
+        if project_height:
+            self._project_arm_height()
+            # Height projection changes the striker-link pose that anchors
+            # the universal joints, so refresh before solving their angles.
+            mujoco.mj_fwdPosition(self.model, self.data)
+        angles = []
+        for body_id in self._link_body_ids:
+            link_rotation = self.data.xmat[body_id].reshape(3, 3)
+            down_in_link = link_rotation.T @ MALLET_DOWN_WORLD
+            angles.extend(_solve_universal_level_angles(down_in_link))
+        angles = np.asarray(angles)
+        lower, upper = self._joint_ranges[:, 0], self._joint_ranges[:, 1]
+        if np.any(angles < lower - 1e-6) or np.any(angles > upper + 1e-6):
+            raise RuntimeError(
+                "cannot level a mallet without exceeding the universal-joint limits: "
+                f"angles={angles.tolist()}, ranges={self._joint_ranges.tolist()}"
+            )
+        self.data.qpos[self._qpos_addrs] = np.clip(angles, lower, upper)
+        self.data.qvel[self._dof_addrs] = 0.0
+        # Disable the stock weak PD torque after it has updated.  The next
+        # boundary projects again, so these joints cannot accumulate tilt.
+        self.data.ctrl[self._actuator_ids] = 0.0
+        if refresh_kinematics:
+            mujoco.mj_fwdPosition(self.model, self.data)
+
+    def install(self):
+        """Wrap reset and 1 ms simulator hooks; safe to call once."""
+        if self._installed:
+            return
+        self._original_pre_step = self.base_env._simulation_pre_step
+        self._original_post_step = self.base_env._simulation_post_step
+        self._original_setup = self.base_env.setup
+
+        def pre_step():
+            self._original_pre_step()
+            # mj_step recomputes position before integration. Project now so
+            # each 1 ms physics interval starts level; its own forward pass
+            # will apply the new universal-joint coordinates. The previous
+            # post-step already restored arm height.
+            self.project(refresh_kinematics=False, project_height=False)
+
+        def post_step():
+            self._original_post_step()
+            # Correct the arm's height and mallet level after every 1 ms
+            # integration interval; the public observation is then built
+            # from this same safe state after the final sub-step.
+            self.project(refresh_kinematics=True, project_height=True)
+
+        def setup(*args, **kwargs):
+            result = self._original_setup(*args, **kwargs)
+            self.project(refresh_kinematics=True, project_height=True)
+            return result
+
+        self.base_env._simulation_pre_step = pre_step
+        self.base_env._simulation_post_step = post_step
+        self.base_env.setup = setup
+        self._installed = True
+
+    def restore(self):
+        """Restore the environment hooks before disposing the simulator."""
+        if not self._installed:
+            return
+        self.base_env._simulation_pre_step = self._original_pre_step
+        self.base_env._simulation_post_step = self._original_post_step
+        self.base_env.setup = self._original_setup
+        self._installed = False
+
+
+def install_hard_mallet_level_guard(mdp):
+    """Attach the mandatory collector safety guard and return it."""
+    guard = HardMalletLevelGuard(mdp)
+    guard.install()
+    mdp._hard_mallet_level_guard = guard
+    return guard
+
+
 def build_mdp(args):
     mdp = AirHockeyChallengeWrapper(
         "tournament",
@@ -893,6 +1148,7 @@ def build_mdp(args):
         getattr(args, "orientation_marker_arm_length", DEFAULT_ORIENTATION_MARKER_ARM_LENGTH),
         getattr(args, "orientation_marker_stroke_width", DEFAULT_ORIENTATION_MARKER_STROKE_WIDTH),
     )
+    install_hard_mallet_level_guard(mdp)
     return mdp
 
 
@@ -904,6 +1160,9 @@ def close_mdp(mdp):
     after the display is gone and __del__ raises EGL_NOT_INITIALIZED
     ("Exception ignored" noise at interpreter shutdown).
     """
+    guard = getattr(mdp, "_hard_mallet_level_guard", None)
+    if guard is not None:
+        guard.restore()
     viewer = mdp.base_env._viewer
     mdp.base_env.stop()
     if viewer is not None and getattr(viewer, "_opengl_context", None) is not None:
@@ -1087,6 +1346,7 @@ def collect_game(game_dir, mdp, agent, args):
         "goal_clearance": GOAL_CLEARANCE,
         "mallet_radius": mdp.env_info["mallet"]["radius"],
         "robot_visual_scale": args.robot_visual_scale,
+        "mallet_level_lock": args.mallet_level_lock,
         "orientation_marker": {
             "style": "asymmetric_forward_cross",
             "arm_length_m": args.orientation_marker_arm_length,
@@ -1154,6 +1414,7 @@ def spawn_workers(args, run_dir):
             "--idle-min-steps", str(args.idle_min_steps),
             "--idle-max-steps", str(args.idle_max_steps),
             "--post-goal-policy", args.post_goal_policy,
+            "--mallet-level-lock", args.mallet_level_lock,
             "--orientation-marker-arm-length", str(args.orientation_marker_arm_length),
             "--orientation-marker-stroke-width", str(args.orientation_marker_stroke_width),
             "--run-dir", str(run_dir), "--game-start", str(game_start),
@@ -1262,6 +1523,12 @@ def main():
         choices=("smooth_random", "keep"),
         default="smooth_random",
         help="Policy for the remaining tail after a real goal (default: smooth_random)",
+    )
+    parser.add_argument(
+        "--mallet-level-lock",
+        choices=("hard_level_height_projection",),
+        default="hard_level_height_projection",
+        help="Mandatory hard mallet level/height safety projection",
     )
     parser.add_argument("--gpu", type=int, default=None,
                         help="nvidia-smi GPU index to pin both inference (CUDA) "
