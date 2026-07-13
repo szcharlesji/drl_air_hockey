@@ -2,3 +2,4 @@ from .multi_strategy_agent import MultiStrategySpaceRAgent
 from .single_strategy_agent import SingleStrategySpaceRAgent
 from .smooth_random_agent import SmoothRandomAgent
 from .spacer_agent import SpaceRAgent
+from .idle_mallet import IdleMalletAgent

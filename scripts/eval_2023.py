@@ -19,6 +19,7 @@ from air_hockey_challenge.utils.tournament_agent_wrapper import (
 )
 from baseline.baseline_agent.baseline_agent import BaselineAgent
 
+from drl_air_hockey.agents.idle_mallet import IdleMalletAgent
 import drl_air_hockey.agents.single_strategy_agent as ssa
 from drl_air_hockey.agents.smooth_random_agent import SmoothRandomAgent
 from drl_air_hockey.utils.config import DIR_MODELS
@@ -34,39 +35,57 @@ MODELS = (
 )
 
 
-def make_agent(env_info, agent_id, model):
+def make_agent(env_info, agent_id, model, idle_probability=0.0):
     if model == "baseline":
-        return BaselineAgent(env_info, agent_id)
-    if model == "smooth_random":
-        return SmoothRandomAgent(env_info, agent_id)
-    # SingleStrategySpaceRAgent hardcodes BalancedAgentStrategy for its
-    # action-scheme kwargs (velocity scaling, operating area). Swap in the
-    # strategy matching the checkpoint before construction.
-    strategy = "balanced"
-    if "aggressive" in model:
-        strategy = "aggressive"
-    elif "defensive" in model:
-        strategy = "defensive"
-    ssa.BalancedAgentStrategy = lambda: strategy_from_str(strategy)
-    return ssa.SingleStrategySpaceRAgent(
-        env_info,
-        agent_id=agent_id,
-        model_path=path.join(DIR_MODELS, f"{model}.ckpt"),
-    )
+        agent = BaselineAgent(env_info, agent_id)
+    elif model == "smooth_random":
+        agent = SmoothRandomAgent(env_info, agent_id)
+    else:
+        # SingleStrategySpaceRAgent hardcodes BalancedAgentStrategy for its
+        # action-scheme kwargs (velocity scaling, operating area). Swap in the
+        # strategy matching the checkpoint before construction.
+        strategy = "balanced"
+        if "aggressive" in model:
+            strategy = "aggressive"
+        elif "defensive" in model:
+            strategy = "defensive"
+        ssa.BalancedAgentStrategy = lambda: strategy_from_str(strategy)
+        agent = ssa.SingleStrategySpaceRAgent(
+            env_info,
+            agent_id=agent_id,
+            model_path=path.join(DIR_MODELS, f"{model}.ckpt"),
+        )
+    return IdleMalletAgent(agent, idle_probability=idle_probability)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model1", default="tournament_balanced", choices=MODELS)
     parser.add_argument("--model2", default="tournament_balanced", choices=MODELS)
+    parser.add_argument(
+        "--idle-probability1",
+        type=float,
+        default=0.0,
+        help="Chance that player 1 holds its initial mallet pose for a full game.",
+    )
+    parser.add_argument(
+        "--idle-probability2",
+        type=float,
+        default=0.0,
+        help="Chance that player 2 holds its initial mallet pose for a full game.",
+    )
     parser.add_argument("-r", "--render", action="store_true", default=False)
     parser.add_argument("--steps", type=int, default=45000, help="Steps per game (45000 = full 15 min game)")
     parser.add_argument("--episodes", type=int, default=1)
     args = parser.parse_args()
 
     def agent_builder(mdp, i, **kwargs):
-        agent_1 = make_agent(mdp.env_info, 1, args.model1)
-        agent_2 = make_agent(mdp.env_info, 2, args.model2)
+        agent_1 = make_agent(
+            mdp.env_info, 1, args.model1, args.idle_probability1
+        )
+        agent_2 = make_agent(
+            mdp.env_info, 2, args.model2, args.idle_probability2
+        )
         return SimpleTournamentAgentWrapper(mdp.env_info, agent_1, agent_2)
 
     _run_tournament(
