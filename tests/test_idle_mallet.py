@@ -76,7 +76,9 @@ def test_idle_probability_must_be_a_probability(probability):
         IdleMalletAgent(_FakeAgent(), idle_probability=probability)
 
 
-@pytest.mark.parametrize("min_steps,max_steps", [(0, 1), (2, 1), (True, 2)])
+@pytest.mark.parametrize(
+    "min_steps,max_steps", [(0, 1), (2, 1), (True, 2), (1.5, 2)]
+)
 def test_idle_pause_length_must_be_valid(min_steps, max_steps):
     with pytest.raises(ValueError, match="idle pause lengths"):
         IdleMalletAgent(

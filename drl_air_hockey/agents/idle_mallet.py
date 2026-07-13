@@ -34,7 +34,12 @@ class IdleMalletAgent:
             raise ValueError(
                 f"idle_probability must be in [0, 1], got {idle_probability!r}"
             )
-        if isinstance(idle_min_steps, bool) or isinstance(idle_max_steps, bool):
+        if (
+            isinstance(idle_min_steps, bool)
+            or isinstance(idle_max_steps, bool)
+            or not isinstance(idle_min_steps, (int, np.integer))
+            or not isinstance(idle_max_steps, (int, np.integer))
+        ):
             raise ValueError("idle pause lengths must be positive integers")
         min_steps = int(idle_min_steps)
         max_steps = int(idle_max_steps)

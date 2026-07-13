@@ -1101,9 +1101,9 @@ def collect_game(game_dir, mdp, agent, args):
                 None if post_goal_agent is None else pause_statistics(post_goal_agent)
             ),
         },
-        "post_goal_policy": (
-            None if post_goal_agent is None else "smooth_random"
-        ),
+        # This is the configured tail policy; ``post_goal_step`` records
+        # whether a real goal activated it during this game.
+        "post_goal_policy": getattr(args, "post_goal_policy", "smooth_random"),
         "post_goal_step": post_goal_step,
         "terminal_events": [] if controller is None else controller.events,
         "event_counts": {} if controller is None else controller.event_counts,
