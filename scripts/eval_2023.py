@@ -35,7 +35,14 @@ MODELS = (
 )
 
 
-def make_agent(env_info, agent_id, model, idle_probability=0.0):
+def make_agent(
+    env_info,
+    agent_id,
+    model,
+    idle_probability=0.0,
+    idle_min_steps=5,
+    idle_max_steps=25,
+):
     if model == "baseline":
         agent = BaselineAgent(env_info, agent_id)
     elif model == "smooth_random":
@@ -55,7 +62,12 @@ def make_agent(env_info, agent_id, model, idle_probability=0.0):
             agent_id=agent_id,
             model_path=path.join(DIR_MODELS, f"{model}.ckpt"),
         )
-    return IdleMalletAgent(agent, idle_probability=idle_probability)
+    return IdleMalletAgent(
+        agent,
+        idle_probability=idle_probability,
+        idle_min_steps=idle_min_steps,
+        idle_max_steps=idle_max_steps,
+    )
 
 
 def main():
@@ -66,14 +78,16 @@ def main():
         "--idle-probability1",
         type=float,
         default=0.0,
-        help="Chance that player 1 holds its initial mallet pose for a full game.",
+        help="Per-unpaused-step chance player 1 starts a random short pause.",
     )
     parser.add_argument(
         "--idle-probability2",
         type=float,
         default=0.0,
-        help="Chance that player 2 holds its initial mallet pose for a full game.",
+        help="Per-unpaused-step chance player 2 starts a random short pause.",
     )
+    parser.add_argument("--idle-min-steps", type=int, default=5)
+    parser.add_argument("--idle-max-steps", type=int, default=25)
     parser.add_argument("-r", "--render", action="store_true", default=False)
     parser.add_argument("--steps", type=int, default=45000, help="Steps per game (45000 = full 15 min game)")
     parser.add_argument("--episodes", type=int, default=1)
@@ -81,10 +95,12 @@ def main():
 
     def agent_builder(mdp, i, **kwargs):
         agent_1 = make_agent(
-            mdp.env_info, 1, args.model1, args.idle_probability1
+            mdp.env_info, 1, args.model1, args.idle_probability1,
+            args.idle_min_steps, args.idle_max_steps,
         )
         agent_2 = make_agent(
-            mdp.env_info, 2, args.model2, args.idle_probability2
+            mdp.env_info, 2, args.model2, args.idle_probability2,
+            args.idle_min_steps, args.idle_max_steps,
         )
         return SimpleTournamentAgentWrapper(mdp.env_info, agent_1, agent_2)
 

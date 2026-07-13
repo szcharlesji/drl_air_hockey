@@ -27,6 +27,11 @@ collection:
     # Absolute metre dimensions: they do not grow with puck_radius.
     orientation_marker_arm_length: 0.08
     orientation_marker_stroke_width: 0.024
+    # Inclusive, randomly sampled 50 Hz pause duration: 0.10--0.50 seconds.
+    idle_min_steps: 5
+    idle_max_steps: 25
+    # Both players switch to smooth_random after the first real goal.
+    post_goal_policy: smooth_random
 
 sources:
   - name: aggressive
@@ -36,8 +41,9 @@ sources:
     workers: 17
     seed_base: 0
     collector_args:
-      idle_prob1: 0.10
-      idle_prob2: 0.10
+      # Independent per-unpaused-step pause onset probability (~one per 4 s).
+      idle_prob1: 0.005
+      idle_prob2: 0.005
   - name: random
     model1: smooth_random
     model2: smooth_random
@@ -45,8 +51,8 @@ sources:
     workers: 7
     seed_base: 100000
     collector_args:
-      idle_prob1: 0.10
-      idle_prob2: 0.10
+      idle_prob1: 0.005
+      idle_prob2: 0.005
 
 mixture:
   fractions:

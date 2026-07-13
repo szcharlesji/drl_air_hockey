@@ -56,6 +56,7 @@ RESERVED_COLLECTOR_OPTION_KEYS = frozenset({
 ALLOWED_COLLECTOR_OPTION_KEYS = frozenset({
     "episode-mode", "orientation-marker-arm-length",
     "orientation-marker-stroke-width", "idle-prob1", "idle-prob2",
+    "idle-min-steps", "idle-max-steps", "post-goal-policy",
     "keep-scoreboard", "shadows", "gpu",
 })
 

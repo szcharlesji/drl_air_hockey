@@ -31,7 +31,7 @@ conda run -n airhockey2023 python scripts/collect_2023.py \
     --platform cpu --model1 smooth_random --model2 smooth_random \
     --games 1 --steps 100 --width 128 --height 128 --fps 50 \
     --puck-radius 0.10 --mallet-radius 0.10 --robot-visual-scale 2.5 \
-    --idle-prob1 0.10 --idle-prob2 0.10 --out /tmp/airhockey-smoke
+    --idle-prob1 0.005 --idle-prob2 0.005 --out /tmp/airhockey-smoke
 
 # Full game = 45000 transitions = 15 min at 50 Hz (the default --steps)
 python scripts/collect_2023.py --model1 tournament_aggressive --model2 tournament_defensive
@@ -69,7 +69,9 @@ python scripts/collect_2023.py --workers 24 --platform cpu --games 24 \
 | `--mallet-radius` | 0.04815 | physical IIWA mallet radius (collision, visual mallet, policy bounds, and tournament reset range) |
 | `--robot-visual-scale` | 1.0 | visual-only IIWA arm-mesh scale; physics and actions are unchanged |
 | `--orientation-marker-arm-length` / `--orientation-marker-stroke-width` | 0.08 / 0.024 m | absolute dimensions of the puck's asymmetric red cross, independent of puck size |
-| `--idle-prob1` / `--idle-prob2` | 0 | per-game probability each player's mallet holds its reset pose for the entire episode |
+| `--idle-prob1` / `--idle-prob2` | 0 | independent per-unpaused-step probability each mallet starts a random pause |
+| `--idle-min-steps` / `--idle-max-steps` | 5 / 25 | inclusive random pause duration (0.10--0.50 s at 50 Hz) |
+| `--post-goal-policy` | `smooth_random` | both players use smooth-random actions after a real goal |
 | `--seed` | 0 | per-game seed = `seed + game_index` |
 | `--keep-scoreboard` | off | bake the score overlay into frames |
 | `--fps` | 50 | verification-video framerate |
@@ -90,9 +92,14 @@ remain visible and keep simulating. The episode still reaches `--steps`.
 Tunables live in `MOTION_PARAMS` at the top of the agent file.
 
 `--idle-prob1` and `--idle-prob2` wrap any policy (including tournament
-policies and `smooth_random`). The decision is sampled once per game; an idle
-mallet holds its measured reset joint pose with zero joint velocity, so it is
-real, physically stationary action data rather than a visual-only effect.
+policies and `smooth_random`) independently. On each unpaused control step,
+they can start a uniformly random 5--25-frame hold of the measured current
+joint pose with zero velocity; the wrapped policy still advances internally.
+The v6 value is `0.005`, roughly one onset per four seconds of active time.
+This naturally yields one-player and two-player pauses without a coordinator.
+After a real goal, both players switch to fresh `smooth_random` policies for
+the hidden-puck tail so an aggressive policy does not produce out-of-context
+motions.
 
 ## Output layout
 
@@ -132,7 +139,8 @@ The versioned YAML config is the source of truth for reproducible SA data:
 3,500 aggressive-vs-aggressive games on 17 CPU workers and 1,500
 smooth-random-vs-smooth-random games on 7 workers. Both sources use a 10 cm
 puck, 10 cm physical mallets, 2.5× arm visuals, a fixed-scale marker, and a
-10% per-player idle-game probability.
+0.5% per-active-step independent pause onset probability with 5--25-frame
+holds.
 
 ```bash
 # Validate the YAML and print the exact two collector and conversion commands.

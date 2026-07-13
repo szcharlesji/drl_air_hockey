@@ -573,7 +573,7 @@ class FixedLengthEventController:
     def hide_pending_puck(self):
         """Hide only a scored puck after its final visible frame is saved."""
         if self.pending_goal is None or self.puck_hidden:
-            return
+            return False
 
         model = self.base_env._model
         data = self.base_env._data
@@ -588,6 +588,7 @@ class FixedLengthEventController:
         mujoco.mj_forward(model, data)
         self.puck_hidden = True
         self.pending_goal = None
+        return True
 
     @property
     def event_counts(self):
@@ -949,6 +950,37 @@ def reset_episode(mdp, agent, video, shadows):
     return state, buffer
 
 
+def make_post_goal_random_agent(mdp, args):
+    """Build fresh smooth-random players for the tail after a scored goal."""
+    return SimpleTournamentAgentWrapper(
+        mdp.env_info,
+        make_agent(
+            mdp.env_info,
+            1,
+            "smooth_random",
+            idle_probability=args.idle_prob1,
+            idle_min_steps=args.idle_min_steps,
+            idle_max_steps=args.idle_max_steps,
+        ),
+        make_agent(
+            mdp.env_info,
+            2,
+            "smooth_random",
+            idle_probability=args.idle_prob2,
+            idle_min_steps=args.idle_min_steps,
+            idle_max_steps=args.idle_max_steps,
+        ),
+    )
+
+
+def pause_statistics(agent):
+    """Return one serializable pause summary per tournament player."""
+    return [
+        dict(getattr(agent.agent_1, "pause_stats", {})),
+        dict(getattr(agent.agent_2, "pause_stats", {})),
+    ]
+
+
 def collect_game(game_dir, mdp, agent, args):
     game_dir.mkdir(parents=True)
     video = open_video_writer(game_dir / "video.mp4", args.width, args.height, args.fps)
@@ -964,6 +996,9 @@ def collect_game(game_dir, mdp, agent, args):
     episode_mode = getattr(args, "episode_mode", "fixed_length")
     fixed_length = episode_mode == "fixed_length"
     controller = FixedLengthEventController(mdp) if fixed_length else None
+    active_agent = agent
+    post_goal_agent = None
+    post_goal_step = None
     if controller is not None:
         controller.install()
 
@@ -975,7 +1010,7 @@ def collect_game(game_dir, mdp, agent, args):
                          disable=args.no_progress):
             if controller is not None:
                 controller.step_index = step
-            action_1, action_2, _, _ = agent.draw_action(state)
+            action_1, action_2, _, _ = active_agent.draw_action(state)
             obs, _, absorbing, info = mdp.step((action_1, action_2))
             # Every event frame remains visible. Only a scored goal hides the
             # puck after this frame; edge and stuck states keep rendering.
@@ -989,8 +1024,14 @@ def collect_game(game_dir, mdp, agent, args):
                 list(info["score"]),
                 list(info["faults"]),
             )
-            if controller is not None:
-                controller.hide_pending_puck()
+            if controller is not None and controller.hide_pending_puck():
+                if getattr(args, "post_goal_policy", "smooth_random") == "smooth_random":
+                    # Do not mutate ``agent``: it is reused for the next game
+                    # and its wrapper caches episode-start bound methods.
+                    post_goal_agent = make_post_goal_random_agent(mdp, args)
+                    post_goal_agent.episode_start()
+                    active_agent = post_goal_agent
+                    post_goal_step = step + 1
             state = obs
 
             if not fixed_length and absorbing:
@@ -1052,11 +1093,18 @@ def collect_game(game_dir, mdp, agent, args):
             "stroke_width_m": args.orientation_marker_stroke_width,
             "fixed_world_scale": True,
         },
-        "idle_probabilities": [args.idle_prob1, args.idle_prob2],
-        "idle_mallets": [
-            bool(getattr(agent.agent_1, "is_idle", False)),
-            bool(getattr(agent.agent_2, "is_idle", False)),
-        ],
+        "pause_probabilities": [args.idle_prob1, args.idle_prob2],
+        "pause_duration_steps": [args.idle_min_steps, args.idle_max_steps],
+        "pause_statistics": {
+            "initial_policy": pause_statistics(agent),
+            "post_goal_random": (
+                None if post_goal_agent is None else pause_statistics(post_goal_agent)
+            ),
+        },
+        "post_goal_policy": (
+            None if post_goal_agent is None else "smooth_random"
+        ),
+        "post_goal_step": post_goal_step,
         "terminal_events": [] if controller is None else controller.events,
         "event_counts": {} if controller is None else controller.event_counts,
         "puck_hidden": False if controller is None else controller.puck_hidden,
@@ -1103,6 +1151,9 @@ def spawn_workers(args, run_dir):
             "--episode-mode", args.episode_mode,
             "--idle-prob1", str(args.idle_prob1),
             "--idle-prob2", str(args.idle_prob2),
+            "--idle-min-steps", str(args.idle_min_steps),
+            "--idle-max-steps", str(args.idle_max_steps),
+            "--post-goal-policy", args.post_goal_policy,
             "--orientation-marker-arm-length", str(args.orientation_marker_arm_length),
             "--orientation-marker-stroke-width", str(args.orientation_marker_stroke_width),
             "--run-dir", str(run_dir), "--game-start", str(game_start),
@@ -1147,7 +1198,7 @@ def main():
         "--episode-mode",
         choices=("fixed_length", "split_on_absorbing"),
         default="fixed_length",
-        help="fixed_length keeps one episode per game and hides a terminal puck; "
+        help="fixed_length keeps one episode per game and hides only a scored puck; "
              "split_on_absorbing preserves the legacy reset-on-terminal behavior",
     )
     parser.add_argument("--out", default="data_2023")
@@ -1186,13 +1237,31 @@ def main():
         "--idle-prob1",
         type=float,
         default=0.0,
-        help="Per-game probability that player 1 holds its initial mallet pose",
+        help="Per-unpaused-step probability player 1 starts a short random pause",
     )
     parser.add_argument(
         "--idle-prob2",
         type=float,
         default=0.0,
-        help="Per-game probability that player 2 holds its initial mallet pose",
+        help="Per-unpaused-step probability player 2 starts a short random pause",
+    )
+    parser.add_argument(
+        "--idle-min-steps",
+        type=int,
+        default=5,
+        help="Minimum inclusive random pause length (5 = 0.10 s at 50 Hz)",
+    )
+    parser.add_argument(
+        "--idle-max-steps",
+        type=int,
+        default=25,
+        help="Maximum inclusive random pause length (25 = 0.50 s at 50 Hz)",
+    )
+    parser.add_argument(
+        "--post-goal-policy",
+        choices=("smooth_random", "keep"),
+        default="smooth_random",
+        help="Policy for the remaining tail after a real goal (default: smooth_random)",
     )
     parser.add_argument("--gpu", type=int, default=None,
                         help="nvidia-smi GPU index to pin both inference (CUDA) "
@@ -1217,6 +1286,8 @@ def main():
                               ("--idle-prob2", args.idle_prob2)):
         if not 0.0 <= probability <= 1.0:
             parser.error(f"{flag} must be in [0, 1]")
+    if args.idle_min_steps <= 0 or args.idle_max_steps < args.idle_min_steps:
+        parser.error("idle pause lengths must satisfy 0 < --idle-min-steps <= --idle-max-steps")
 
     run_dir = (
         Path(args.run_dir) if args.run_dir
@@ -1241,8 +1312,14 @@ def main():
     # episode_start() fully resets their recurrent state between episodes.
     agent = SimpleTournamentAgentWrapper(
         mdp.env_info,
-        make_agent(mdp.env_info, 1, args.model1, idle_probability=args.idle_prob1),
-        make_agent(mdp.env_info, 2, args.model2, idle_probability=args.idle_prob2),
+        make_agent(
+            mdp.env_info, 1, args.model1, idle_probability=args.idle_prob1,
+            idle_min_steps=args.idle_min_steps, idle_max_steps=args.idle_max_steps,
+        ),
+        make_agent(
+            mdp.env_info, 2, args.model2, idle_probability=args.idle_prob2,
+            idle_min_steps=args.idle_min_steps, idle_max_steps=args.idle_max_steps,
+        ),
     )
 
     for i in range(args.games):
