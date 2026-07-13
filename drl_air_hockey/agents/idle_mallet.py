@@ -18,8 +18,8 @@ class IdleMalletAgent:
 
     ``idle_probability`` is the chance to start a pause on an *unpaused*
     control step. A pause lasts uniformly from ``idle_min_steps`` through
-    ``idle_max_steps`` inclusive. At 50 Hz, the default 5--25 steps is
-    0.10--0.50 seconds. The wrapped policy is not advanced during a pause, so
+    ``idle_max_steps`` inclusive. At 50 Hz, the default 50--250 steps is
+    1--5 seconds. The wrapped policy is not advanced during a pause, so
     it resumes from the actual post-hold observation without a stale-command
     jump.
     """
@@ -28,8 +28,8 @@ class IdleMalletAgent:
         self,
         agent: Any,
         idle_probability: float = 0.0,
-        idle_min_steps: int = 5,
-        idle_max_steps: int = 25,
+        idle_min_steps: int = 50,
+        idle_max_steps: int = 250,
     ):
         probability = float(idle_probability)
         if not 0.0 <= probability <= 1.0:

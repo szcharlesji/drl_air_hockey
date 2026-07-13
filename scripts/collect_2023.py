@@ -1509,14 +1509,14 @@ def main():
     parser.add_argument(
         "--idle-min-steps",
         type=int,
-        default=5,
-        help="Minimum inclusive random pause length (5 = 0.10 s at 50 Hz)",
+        default=50,
+        help="Minimum inclusive random pause length (50 = 1 s at 50 Hz)",
     )
     parser.add_argument(
         "--idle-max-steps",
         type=int,
-        default=25,
-        help="Maximum inclusive random pause length (25 = 0.50 s at 50 Hz)",
+        default=250,
+        help="Maximum inclusive random pause length (250 = 5 s at 50 Hz)",
     )
     parser.add_argument(
         "--post-goal-policy",

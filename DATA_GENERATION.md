@@ -70,7 +70,7 @@ python scripts/collect_2023.py --workers 24 --platform cpu --games 24 \
 | `--robot-visual-scale` | 1.0 | visual-only IIWA arm-mesh scale; physics and actions are unchanged |
 | `--orientation-marker-arm-length` / `--orientation-marker-stroke-width` | 0.08 / 0.024 m | absolute dimensions of the puck's asymmetric red cross, independent of puck size |
 | `--idle-prob1` / `--idle-prob2` | 0 | independent per-unpaused-step probability each mallet starts a random pause |
-| `--idle-min-steps` / `--idle-max-steps` | 5 / 25 | inclusive random pause duration (0.10--0.50 s at 50 Hz) |
+| `--idle-min-steps` / `--idle-max-steps` | 50 / 250 | inclusive random pause duration (1--5 s at 50 Hz) |
 | `--post-goal-policy` | `smooth_random` | both players use smooth-random actions after a real goal |
 | `--mallet-level-lock` | `hard_level_height_projection` | mandatory level/height safety projection for both mallets |
 | `--seed` | 0 | per-game seed = `seed + game_index` |
@@ -94,7 +94,7 @@ Tunables live in `MOTION_PARAMS` at the top of the agent file.
 
 `--idle-prob1` and `--idle-prob2` wrap any policy (including tournament
 policies and `smooth_random`) independently. On each unpaused control step,
-they can start a uniformly random 5--25-frame hold of the last issued,
+they can start a uniformly random 50--250-frame hold of the last issued,
 IK-valid joint target with zero velocity. The policy is frozen during the
 hold, then resumes from the actual robot state, avoiding a stale-command jump.
 The v6 value is `0.005`, roughly one onset per four seconds of active time.
@@ -146,7 +146,7 @@ The versioned YAML config is the source of truth for reproducible SA data:
 3,500 aggressive-vs-aggressive games on 17 CPU workers and 1,500
 smooth-random-vs-smooth-random games on 7 workers. Both sources use a 10 cm
 puck, 10 cm physical mallets, 2.5× arm visuals, a fixed-scale marker, and a
-0.5% per-active-step independent pause onset probability with 5--25-frame
+0.5% per-active-step independent pause onset probability with 50--250-frame
 holds.
 
 ```bash
