@@ -12,6 +12,7 @@ dependencies = [
   "AirHockeyChallenge==1.0.0",
   "dreamerv3 @ git+https://github.com/AndrejOrsula/dreamerv3.git@d4f47fcb18f52777314f2735389cd1f449513c9a",
   "zmq",
+  "PyYAML>=6.0",
 ]
 
 [tool.setuptools]

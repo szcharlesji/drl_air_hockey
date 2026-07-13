@@ -17,9 +17,10 @@ image[k], action[0] = zeros), so per episode we store
 dropping the final frame, which has no outgoing action.
 
 Frames are box-downsampled (exact integer factor, e.g. 256 -> 128). Each
---source is a directory containing collect-*/game_*/ (or game_*/ directly);
-the train/valid split is done at GAME level per source so validation games
-are entirely held out.
+--source is a directory containing completed collect-*/game_*/ (or game_*/
+directly); a game is complete only after its collector has atomically written
+meta.json and at least one episode archive. The train/valid split is done at
+GAME level per source so validation games are entirely held out.
 
 Example:
     python scripts/convert_npz_to_sa_h5.py \
@@ -60,11 +61,26 @@ def parse_args():
     return parser.parse_args()
 
 
+def is_complete_game(game_dir):
+    """Whether a collector finished this game and wrote usable episode data."""
+    meta_path = game_dir / "meta.json"
+    if not meta_path.is_file() or not any(game_dir.glob("episode_*.npz")):
+        return False
+    try:
+        metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+        if not isinstance(metadata, dict):
+            return False
+        n_episodes = int(metadata.get("n_episodes", 0))
+    except (AttributeError, OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+    return n_episodes > 0
+
+
 def discover_games(source_dir):
-    """Return the game dirs under a source, sorted by (run, game index)."""
+    """Return completed game dirs under a source, sorted by run and index."""
     root = Path(source_dir)
     games = sorted(root.glob("collect-*/game_*")) + sorted(root.glob("game_*"))
-    return [g for g in games if g.is_dir()]
+    return [game for game in games if game.is_dir() and is_complete_game(game)]
 
 
 def load_episode(task):
@@ -153,7 +169,7 @@ def main():
             raise SystemExit(f"--source must be NAME=DIR, got: {spec}")
         games = discover_games(src_dir)
         if not games:
-            raise SystemExit(f"no game_* dirs found under {src_dir}")
+            raise SystemExit(f"no completed game_* dirs found under {src_dir}")
         n_val = 0 if len(games) < 2 else max(1, round(args.val_frac * len(games)))
         source_stats[name] = {"dir": str(src_dir), "games": len(games), "val_games": n_val}
         for gi, game in enumerate(games):
