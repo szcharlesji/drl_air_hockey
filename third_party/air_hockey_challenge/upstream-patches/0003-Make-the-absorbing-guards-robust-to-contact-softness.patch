@@ -1,0 +1,39 @@
+From 5fe33357ecdc8e5baaecd30f85595b7bca555e8f Mon Sep 17 00:00:00 2001
+From: Charles Ji <me@charlesji.com>
+Date: Thu, 9 Jul 2026 18:31:48 -0400
+Subject: [PATCH 3/3] Make the absorbing guards robust to contact softness and
+ spin
+
+The catch-all in is_absorbing compared norm([vx, vy, yaw_rate]) > 100,
+mixing rad/s into an m/s norm, so a harmlessly spinning puck ended
+episodes with no goal and no fault; guard linear speed only. Also add
+1 cm of tolerance to the center-out-of-bounds check so soft-contact
+penetration at walls and goal posts cannot trigger it. Default-puck
+tournament games are unchanged (verified step-identical over 6000
+steps); both guards fired spuriously with enlarged pucks.
+---
+ air_hockey_challenge/environments/iiwas/env_base.py | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/air_hockey_challenge/environments/iiwas/env_base.py b/air_hockey_challenge/environments/iiwas/env_base.py
+index 77ba2ef..d582683 100644
+--- a/air_hockey_challenge/environments/iiwas/env_base.py
++++ b/air_hockey_challenge/environments/iiwas/env_base.py
+@@ -206,7 +206,13 @@ class AirHockeyBase(MuJoCo):
+         boundary = np.array([self.env_info['table']['length'], self.env_info['table']['width']]) / 2
+         puck_pos, puck_vel = self.get_puck(obs)
+ 
+-        if np.any(np.abs(puck_pos[:2]) > boundary) or np.linalg.norm(puck_vel) > 100:
++        # 1 cm tolerance so soft-contact penetration at the walls (or at the
++        # goal posts, where the goal check does not apply) cannot end the
++        # episode; genuine goal entries and escapes exceed it immediately.
++        # Speed guard on the linear components only: puck_vel[2] is the yaw
++        # rate in rad/s, and mixing it into an m/s norm ends episodes on
++        # harmless spin.
++        if np.any(np.abs(puck_pos[:2]) > boundary + 0.01) or np.linalg.norm(puck_vel[:2]) > 100:
+             return True
+         return False
+ 
+-- 
+2.43.0
+

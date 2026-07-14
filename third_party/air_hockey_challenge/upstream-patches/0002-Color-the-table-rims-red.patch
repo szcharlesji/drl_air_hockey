@@ -1,0 +1,37 @@
+From b07518917c7bcaf4e70ec3c21f04fb2333ee065d Mon Sep 17 00:00:00 2001
+From: Charles Ji <me@charlesji.com>
+Date: Thu, 9 Jul 2026 17:34:28 -0400
+Subject: [PATCH 2/3] Color the table rims red
+
+Low-specular dark red so the top-down light keeps it saturated and the
+pure-red puck stays distinguishable.
+---
+ air_hockey_challenge/environments/data/table.xml | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/air_hockey_challenge/environments/data/table.xml b/air_hockey_challenge/environments/data/table.xml
+index fd1bb73..1a7e826 100644
+--- a/air_hockey_challenge/environments/data/table.xml
++++ b/air_hockey_challenge/environments/data/table.xml
+@@ -3,6 +3,9 @@
+ 
+     <asset>
+         <material name="grey" specular="0.5" shininess="0.25" rgba="0.8 0.8 0.8 1"/>
++        <!-- Darker than the puck's pure red so the two stay distinguishable;
++             low specular so the top-down light doesn't wash it out. -->
++        <material name="rim_red" specular="0.1" shininess="0.05" rgba="0.65 0.05 0.05 1"/>
+         <material name="white" specular="0.5" shininess="0.25" rgba="1.0 1.0 1.0 1"/>
+         <material name="red" specular="0.5" shininess="0.25" rgba="1.0 0.0 0.0 1"/>
+         <material name="blue" specular="0.5" shininess="0.25" rgba="0.0 0.0 1.0 1"/>
+@@ -21,7 +24,7 @@
+     <default>
+         <geom condim="4" solref="0.02 0.3"/>
+         <default class="rim">
+-            <geom type="box" material="grey" condim="6" friction="10000 0.0 0.0" priority="1"
++            <geom type="box" material="rim_red" condim="6" friction="10000 0.0 0.0" priority="1"
+                   solref="0.0075 0.1" solimp="0.99 0.999 0.001 0.5 2"/>
+         </default>
+     </default>
+-- 
+2.43.0
+
