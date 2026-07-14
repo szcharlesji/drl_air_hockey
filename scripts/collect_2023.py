@@ -888,13 +888,21 @@ def set_robot_visual_scale(mdp, scale):
 
 
 MALLET_DOWN_WORLD = np.array((0.0, 0.0, -1.0))
-# The striker's XML limits use a rounded pi/2.  A fully level solution can
-# therefore land a few 1e-4 rad beyond the written range at a kinematic edge.
-# Clamp only this numerically negligible residual (<= 0.057 degrees); a larger
-# error would leave a visibly tilted, potentially unsafe mallet and must fail.
-NEAR_LEVEL_LIMIT_TOLERANCE_RAD = 1e-3
+TABLE_TOP_Z = 0.0
+# Aim corrections at a small positive clearance so a feasible pose settles
+# above the surface. The guard measures the actual cylinder support point,
+# rather than guessing from an angle tolerance.
+MALLET_MIN_TABLE_CLEARANCE_M = 2e-4
+# At a stretched arm pose the exactly-level solution can exceed the universal
+# joint range by a few milliradians, and lifting the arm there re-clamps the
+# re-levelled wrist even harder, so a sub-millimetre rim dip can be truly
+# unavoidable. The cameras render the ~2 m table onto 128 px (~15 mm per
+# pixel), so a dip below this bound cannot reach a rendered pixel; deeper
+# penetration still aborts because it signals a genuine geometry bug.
+MALLET_MAX_TABLE_PENETRATION_M = 1.5e-3
+_FLOOR_GUARD_DEBUG = os.environ.get("AIRHOCKEY_FLOOR_GUARD_DEBUG", "0") != "0"
 # The nominal striker-link height leaves about 14 mm of physical-mallet
-# clearance above the table.  Never permit a meaningful drop below it; a link
+# clearance above the table. Never permit a meaningful drop below it; a link
 # that is slightly high is harmless and should not abort a completed worker.
 MAX_HEIGHT_BELOW_TARGET_M = 2e-4
 
@@ -924,26 +932,23 @@ def _solve_universal_level_angles(down_in_link_frame):
 
 
 def _clamp_near_limit_level_angles(angles, joint_ranges):
-    """Clamp only numerically-near universal-joint limit overshoots.
+    """Project universal-joint targets onto their physical limits.
 
-    The residual at the configured tolerance changes the mallet rim height by
-    at most 0.1 mm for a 10 cm mallet, far below the physical clearance. A
-    larger overshoot signals an infeasible level pose and remains an error
-    rather than silently allowing a dangerous tilt.
+    At a kinematic edge a perfectly level solution may be just outside the
+    rounded XML limits. The caller checks the *actual cylinder floor* after
+    clipping and raises the arm as needed, so clipping cannot put a mallet
+    through the table.
     """
     angles = np.asarray(angles, dtype=float)
     ranges = np.asarray(joint_ranges, dtype=float)
-    if angles.ndim != 1 or ranges.shape != (angles.size, 2):
+    if (
+        angles.ndim != 1
+        or not np.all(np.isfinite(angles))
+        or ranges.shape != (angles.size, 2)
+        or not np.all(np.isfinite(ranges))
+    ):
         raise ValueError("joint_ranges must have shape (len(angles), 2)")
     lower, upper = ranges[:, 0], ranges[:, 1]
-    excess = np.maximum(np.maximum(lower - angles, angles - upper), 0.0)
-    max_excess = float(np.max(excess, initial=0.0))
-    if max_excess > NEAR_LEVEL_LIMIT_TOLERANCE_RAD:
-        raise RuntimeError(
-            "cannot level a mallet without exceeding the universal-joint limits: "
-            f"angles={angles.tolist()}, ranges={ranges.tolist()}, "
-            f"max_excess={max_excess:.6f} rad"
-        )
     return np.clip(angles, lower, upper)
 
 
@@ -969,6 +974,9 @@ class HardMalletLevelGuard:
         self._dof_addrs = []
         self._actuator_ids = []
         self._joint_ranges = []
+        self._mallet_geom_ids = []
+        self._mallet_radii = []
+        self._mallet_half_heights = []
         self._arm_qpos_addrs = []
         self._arm_dof_addrs = []
         self._arm_joint_ranges = []
@@ -977,6 +985,10 @@ class HardMalletLevelGuard:
                 self.model.body(f"iiwa_{agent_idx}/striker_joint_link").id
             )
             self._base_body_ids.append(self.model.body(f"iiwa_{agent_idx}/base").id)
+            mallet_geom = self.model.geom(f"iiwa_{agent_idx}/ee")
+            self._mallet_geom_ids.append(mallet_geom.id)
+            self._mallet_radii.append(float(mallet_geom.size[0]))
+            self._mallet_half_heights.append(float(mallet_geom.size[1]))
             arm_qpos_addrs, arm_dof_addrs, arm_joint_ranges = [], [], []
             for joint_idx in range(1, 8):
                 joint = self.model.joint(f"iiwa_{agent_idx}/joint_{joint_idx}")
@@ -1002,21 +1014,50 @@ class HardMalletLevelGuard:
         self._dof_addrs = np.asarray(self._dof_addrs, dtype=int)
         self._actuator_ids = np.asarray(self._actuator_ids, dtype=int)
         self._joint_ranges = np.asarray(self._joint_ranges, dtype=float)
+        self._mallet_geom_ids = np.asarray(self._mallet_geom_ids, dtype=int)
+        self._mallet_radii = np.asarray(self._mallet_radii, dtype=float)
+        self._mallet_half_heights = np.asarray(self._mallet_half_heights, dtype=float)
         self._arm_qpos_addrs = np.asarray(self._arm_qpos_addrs, dtype=int)
         self._arm_dof_addrs = np.asarray(self._arm_dof_addrs, dtype=int)
         self._arm_joint_ranges = np.asarray(self._arm_joint_ranges, dtype=float)
-        self._ee_desired_height = float(mdp.env_info["robot"]["ee_desired_height"])
+        # The stock target leaves the cylinder flush with the table. Keep a
+        # small base clearance so the floor correction below runs only at a
+        # genuinely clipped universal-joint pose.
+        self._ee_desired_height = (
+            float(mdp.env_info["robot"]["ee_desired_height"])
+            + MALLET_MIN_TABLE_CLEARANCE_M
+        )
         self._installed = False
 
-    def _project_arm_height(self):
-        """Restore each striker-link height while preserving its live XY."""
+    def _project_arm_height(self, extra_height=None):
+        """Restore each striker-link height while preserving its live XY.
+
+        Returns how far each link still sits below its target so the caller
+        decides what a failure means: the nominal restore treats a meaningful
+        drop as fatal, while the floor-correction rounds judge the measured
+        cylinder floor instead of the intermediate link height.
+        """
+        if extra_height is None:
+            extra_height = np.zeros(len(self._link_body_ids))
+        extra_height = np.asarray(extra_height, dtype=float)
+        if (
+            extra_height.shape != (len(self._link_body_ids),)
+            or not np.all(np.isfinite(extra_height))
+            or np.any(extra_height < 0)
+        ):
+            raise ValueError("extra_height must be one nonnegative value per mallet")
+        height_errors = np.zeros(len(self._link_body_ids))
         jac_pos = np.empty((3, self.model.nv))
         jac_rot = np.empty((3, self.model.nv))
         for agent_idx, (base_body_id, link_body_id) in enumerate(
             zip(self._base_body_ids, self._link_body_ids)
         ):
             target = self.data.xpos[link_body_id].copy()
-            target[2] = self.data.xpos[base_body_id, 2] + self._ee_desired_height
+            target[2] = (
+                self.data.xpos[base_body_id, 2]
+                + self._ee_desired_height
+                + extra_height[agent_idx]
+            )
             qpos_addrs = self._arm_qpos_addrs[agent_idx]
             dof_addrs = self._arm_dof_addrs[agent_idx]
             lower = self._arm_joint_ranges[agent_idx, :, 0]
@@ -1043,12 +1084,7 @@ class HardMalletLevelGuard:
                 self.data.qpos[qpos_addrs] = next_qpos
                 mujoco.mj_fwdPosition(self.model, self.data)
 
-            height_error = target[2] - self.data.xpos[link_body_id, 2]
-            if height_error > MAX_HEIGHT_BELOW_TARGET_M:
-                raise RuntimeError(
-                    f"cannot keep iiwa_{agent_idx + 1} mallet safely above its "
-                    f"target height: error={height_error:.6f} m"
-                )
+            height_errors[agent_idx] = target[2] - self.data.xpos[link_body_id, 2]
             # Remove only the arm velocity component that would immediately
             # reintroduce vertical motion. This leaves horizontal play intact.
             mujoco.mj_jacBody(self.model, self.data, jac_pos, jac_rot, link_body_id)
@@ -1059,6 +1095,103 @@ class HardMalletLevelGuard:
                 arm_velocity
                 - jacobian_z * (jacobian_z @ arm_velocity) / denominator
             )
+        return height_errors
+
+    def _set_level_angles(self, refresh_kinematics):
+        """Set the closest feasible passive-joint orientation."""
+        angles = []
+        for body_id in self._link_body_ids:
+            link_rotation = self.data.xmat[body_id].reshape(3, 3)
+            down_in_link = link_rotation.T @ MALLET_DOWN_WORLD
+            angles.extend(_solve_universal_level_angles(down_in_link))
+        self.data.qpos[self._qpos_addrs] = _clamp_near_limit_level_angles(
+            np.asarray(angles), self._joint_ranges
+        )
+        self.data.qvel[self._dof_addrs] = 0.0
+        # Disable the stock weak PD torque after it has updated. The next
+        # boundary projects again, so these joints cannot accumulate tilt.
+        self.data.ctrl[self._actuator_ids] = 0.0
+        if refresh_kinematics:
+            mujoco.mj_fwdPosition(self.model, self.data)
+
+    def _mallet_floor_zs(self):
+        """Return each physical cylinder's lowest world-space z coordinate."""
+        floors = []
+        for geom_id, radius, half_height in zip(
+            self._mallet_geom_ids, self._mallet_radii, self._mallet_half_heights
+        ):
+            rotation = self.data.geom_xmat[geom_id].reshape(3, 3)
+            axis_z = float(np.clip(rotation[2, 2], -1.0, 1.0))
+            vertical_support = (
+                half_height * abs(axis_z)
+                + radius * np.sqrt(max(0.0, 1.0 - axis_z * axis_z))
+            )
+            floors.append(self.data.geom_xpos[geom_id, 2] - vertical_support)
+        return np.asarray(floors)
+
+    def _agent_pose(self, agent_idx):
+        """Copy one arm's controlled and passive joint coordinates."""
+        striker = slice(2 * agent_idx, 2 * agent_idx + 2)
+        return (
+            self.data.qpos[self._arm_qpos_addrs[agent_idx]].copy(),
+            self.data.qpos[self._qpos_addrs[striker]].copy(),
+        )
+
+    def _apply_agent_pose(self, agent_idx, pose):
+        arm_qpos, striker_qpos = pose
+        striker = slice(2 * agent_idx, 2 * agent_idx + 2)
+        self.data.qpos[self._arm_qpos_addrs[agent_idx]] = arm_qpos
+        self.data.qpos[self._qpos_addrs[striker]] = striker_qpos
+
+    def _correct_floor_penetration(self):
+        """Lift a sunken mallet only while lifting measurably helps.
+
+        At a stretched pose each lift can re-clamp the re-levelled universal
+        joints a little harder, so lift-and-relevel may diverge instead of
+        converging. Track the best measured pose per mallet, stop after a
+        round that helps no mallet, and settle on the best pose seen. The
+        final bound is render visibility rather than exact non-penetration
+        because a clamped universal joint makes exact levelness infeasible at
+        a few workspace-edge poses.
+        """
+        floors = self._mallet_floor_zs()
+        if not np.any(floors < TABLE_TOP_Z):
+            return
+        history = [floors.tolist()]
+        best_floors = floors.copy()
+        best_poses = [self._agent_pose(i) for i in range(len(best_floors))]
+        cumulative_lift = np.zeros(len(best_floors))
+        for _ in range(4):
+            deficits = np.maximum(
+                TABLE_TOP_Z + MALLET_MIN_TABLE_CLEARANCE_M - floors, 0.0
+            )
+            if not np.any(deficits > 1e-7):
+                break
+            cumulative_lift += deficits
+            self._project_arm_height(cumulative_lift)
+            self._set_level_angles(refresh_kinematics=True)
+            floors = self._mallet_floor_zs()
+            history.append(floors.tolist())
+            improved = floors > best_floors + 1e-7
+            for agent_idx in np.flatnonzero(improved):
+                best_floors[agent_idx] = floors[agent_idx]
+                best_poses[agent_idx] = self._agent_pose(agent_idx)
+            if not np.any(improved):
+                break
+        worse = floors < best_floors - 1e-9
+        if np.any(worse):
+            for agent_idx in np.flatnonzero(worse):
+                self._apply_agent_pose(agent_idx, best_poses[agent_idx])
+            mujoco.mj_fwdPosition(self.model, self.data)
+            floors = self._mallet_floor_zs()
+            history.append(floors.tolist())
+        if _FLOOR_GUARD_DEBUG:
+            print(f"floor-guard rounds: {history}", flush=True)
+        if np.any(floors < TABLE_TOP_Z - MALLET_MAX_TABLE_PENETRATION_M):
+            raise RuntimeError(
+                "a mallet sinks visibly below the table at its best reachable "
+                f"pose: floor_zs={floors.tolist()}, rounds={history}"
+            )
 
     def project(self, refresh_kinematics=True, project_height=True):
         """Hard-set safe arm height and passive mallet orientation."""
@@ -1067,25 +1200,18 @@ class HardMalletLevelGuard:
         # current; otherwise one projection can lag a moving arm slightly.
         mujoco.mj_fwdPosition(self.model, self.data)
         if project_height:
-            self._project_arm_height()
+            height_errors = self._project_arm_height()
+            if np.any(height_errors > MAX_HEIGHT_BELOW_TARGET_M):
+                raise RuntimeError(
+                    "cannot keep a mallet safely above its target height: "
+                    f"height_errors={height_errors.tolist()}"
+                )
             # Height projection changes the striker-link pose that anchors
             # the universal joints, so refresh before solving their angles.
             mujoco.mj_fwdPosition(self.model, self.data)
-        angles = []
-        for body_id in self._link_body_ids:
-            link_rotation = self.data.xmat[body_id].reshape(3, 3)
-            down_in_link = link_rotation.T @ MALLET_DOWN_WORLD
-            angles.extend(_solve_universal_level_angles(down_in_link))
-        angles = np.asarray(angles)
-        self.data.qpos[self._qpos_addrs] = _clamp_near_limit_level_angles(
-            angles, self._joint_ranges
-        )
-        self.data.qvel[self._dof_addrs] = 0.0
-        # Disable the stock weak PD torque after it has updated.  The next
-        # boundary projects again, so these joints cannot accumulate tilt.
-        self.data.ctrl[self._actuator_ids] = 0.0
-        if refresh_kinematics:
-            mujoco.mj_fwdPosition(self.model, self.data)
+        self._set_level_angles(refresh_kinematics=project_height or refresh_kinematics)
+        if project_height:
+            self._correct_floor_penetration()
 
     def install(self):
         """Wrap reset and 1 ms simulator hooks; safe to call once."""
