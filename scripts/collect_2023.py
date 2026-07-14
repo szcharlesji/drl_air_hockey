@@ -888,6 +888,15 @@ def set_robot_visual_scale(mdp, scale):
 
 
 MALLET_DOWN_WORLD = np.array((0.0, 0.0, -1.0))
+# The striker's XML limits use a rounded pi/2.  A fully level solution can
+# therefore land a few 1e-4 rad beyond the written range at a kinematic edge.
+# Clamp only this numerically negligible residual (<= 0.057 degrees); a larger
+# error would leave a visibly tilted, potentially unsafe mallet and must fail.
+NEAR_LEVEL_LIMIT_TOLERANCE_RAD = 1e-3
+# The nominal striker-link height leaves about 14 mm of physical-mallet
+# clearance above the table.  Never permit a meaningful drop below it; a link
+# that is slightly high is harmless and should not abort a completed worker.
+MAX_HEIGHT_BELOW_TARGET_M = 2e-4
 
 
 def _solve_universal_level_angles(down_in_link_frame):
@@ -912,6 +921,30 @@ def _solve_universal_level_angles(down_in_link_frame):
             -np.arcsin(np.clip(down[1], -1.0, 1.0)),
         )
     )
+
+
+def _clamp_near_limit_level_angles(angles, joint_ranges):
+    """Clamp only numerically-near universal-joint limit overshoots.
+
+    The residual at the configured tolerance changes the mallet rim height by
+    at most 0.1 mm for a 10 cm mallet, far below the physical clearance. A
+    larger overshoot signals an infeasible level pose and remains an error
+    rather than silently allowing a dangerous tilt.
+    """
+    angles = np.asarray(angles, dtype=float)
+    ranges = np.asarray(joint_ranges, dtype=float)
+    if angles.ndim != 1 or ranges.shape != (angles.size, 2):
+        raise ValueError("joint_ranges must have shape (len(angles), 2)")
+    lower, upper = ranges[:, 0], ranges[:, 1]
+    excess = np.maximum(np.maximum(lower - angles, angles - upper), 0.0)
+    max_excess = float(np.max(excess, initial=0.0))
+    if max_excess > NEAR_LEVEL_LIMIT_TOLERANCE_RAD:
+        raise RuntimeError(
+            "cannot level a mallet without exceeding the universal-joint limits: "
+            f"angles={angles.tolist()}, ranges={ranges.tolist()}, "
+            f"max_excess={max_excess:.6f} rad"
+        )
+    return np.clip(angles, lower, upper)
 
 
 class HardMalletLevelGuard:
@@ -990,7 +1023,7 @@ class HardMalletLevelGuard:
             upper = self._arm_joint_ranges[agent_idx, :, 1]
             # A small damped least-squares projection avoids changing the
             # current XY endpoint while recovering the policy's fixed height.
-            for _ in range(6):
+            for _ in range(8):
                 current = self.data.xpos[link_body_id]
                 error = target - current
                 if np.linalg.norm(error) <= 1e-5:
@@ -1011,10 +1044,10 @@ class HardMalletLevelGuard:
                 mujoco.mj_fwdPosition(self.model, self.data)
 
             height_error = target[2] - self.data.xpos[link_body_id, 2]
-            if abs(height_error) > 1e-4:
+            if height_error > MAX_HEIGHT_BELOW_TARGET_M:
                 raise RuntimeError(
-                    f"cannot restore iiwa_{agent_idx + 1} mallet height: "
-                    f"error={height_error:.6f} m"
+                    f"cannot keep iiwa_{agent_idx + 1} mallet safely above its "
+                    f"target height: error={height_error:.6f} m"
                 )
             # Remove only the arm velocity component that would immediately
             # reintroduce vertical motion. This leaves horizontal play intact.
@@ -1044,13 +1077,9 @@ class HardMalletLevelGuard:
             down_in_link = link_rotation.T @ MALLET_DOWN_WORLD
             angles.extend(_solve_universal_level_angles(down_in_link))
         angles = np.asarray(angles)
-        lower, upper = self._joint_ranges[:, 0], self._joint_ranges[:, 1]
-        if np.any(angles < lower - 1e-6) or np.any(angles > upper + 1e-6):
-            raise RuntimeError(
-                "cannot level a mallet without exceeding the universal-joint limits: "
-                f"angles={angles.tolist()}, ranges={self._joint_ranges.tolist()}"
-            )
-        self.data.qpos[self._qpos_addrs] = np.clip(angles, lower, upper)
+        self.data.qpos[self._qpos_addrs] = _clamp_near_limit_level_angles(
+            angles, self._joint_ranges
+        )
         self.data.qvel[self._dof_addrs] = 0.0
         # Disable the stock weak PD torque after it has updated.  The next
         # boundary projects again, so these joints cannot accumulate tilt.
