@@ -1,14 +1,14 @@
 # Fixed-length 50 Hz air-hockey data for the SA world model.
 #
-# 5,000 games x 1,000 transitions = 5,000,000 transitions before any
-# converter min-length filtering. The source game counts enforce a 70/30
+# 1,000 games x 1,000 transitions = 1,000,000 transitions before any
+# converter min-length filtering. The source game counts enforce a 50/50
 # aggressive/random mixture. Re-running resumes only incomplete target totals
 # with fresh seeds and rebuilds the H5 root from completed raw games.
 version: 1
 
 dataset:
-  raw_dir: /home_shared/grail_charles/data/raw_2023_puck100_mallet100_arm25_v6
-  h5_dir: /home_shared/grail_charles/data/airhockey_sa_h5_puck100_mallet100_arm25_v6_5m
+  raw_dir: /home_shared/grail_charles/data/raw_2023_puck100_mallet100_arm15_v6_1m
+  h5_dir: /home_shared/grail_charles/data/airhockey_sa_h5_puck100_mallet100_arm15_v6_1m
 
 collection:
   conda_env: airhockey2023
@@ -19,7 +19,7 @@ collection:
   fps: 50
   puck_radius: 0.10
   mallet_radius: 0.10
-  robot_visual_scale: 2.5
+  robot_visual_scale: 1.5
   # Keys here map directly to collect_2023.py flags. Fixed-length mode hides
   # only a scored puck; edge and stuck pucks remain visible.
   collector_args:
@@ -39,8 +39,8 @@ sources:
   - name: aggressive
     model1: tournament_aggressive
     model2: tournament_aggressive
-    games: 3500
-    workers: 17
+    games: 500
+    workers: 12
     seed_base: 0
     collector_args:
       # Independent per-unpaused-step pause onset probability (~one per 4 s).
@@ -49,8 +49,8 @@ sources:
   - name: random
     model1: smooth_random
     model2: smooth_random
-    games: 1500
-    workers: 7
+    games: 500
+    workers: 12
     seed_base: 100000
     collector_args:
       idle_prob1: 0.005
@@ -58,8 +58,8 @@ sources:
 
 mixture:
   fractions:
-    aggressive: 0.70
-    random: 0.30
+    aggressive: 0.50
+    random: 0.50
 
 conversion:
   img_size: 128

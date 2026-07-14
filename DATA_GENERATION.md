@@ -5,13 +5,19 @@ games played by the pretrained DreamerV3 agents. One pass does everything:
 headless GPU (EGL) rendering, per-episode `.npz` files, a per-game `.mp4` for
 human verification, and a `meta.json` per game. No `dataset.pkl`, no replay step.
 
-Everything lives on the `data-collection` branch of **two** repos:
-- this repo (`drl_air_hockey_2023`) — the collector and pretrained-model glue;
-- `air_hockey_challenge_2023` — the env (visual changes + absorbing-guard fixes).
+Everything lives in **this repo** on the `data-collection` branch:
+- the collector and pretrained-model glue (`scripts/`, `drl_air_hockey/`);
+- the vendored 2023 challenge env with the project's visual changes and
+  absorbing-guard fixes (`third_party/air_hockey_challenge/`, provenance in
+  its `UPSTREAM.md`);
+- `setup_env_2023.bash` — builds the pinned `airhockey2023` conda env from
+  scratch on a new machine (the gitignored
+  `drl_air_hockey/agents/models/*.ckpt` must be copied over first).
 
 ## Setup (one-time)
 
 ```bash
+bash setup_env_2023.bash   # skip if the airhockey2023 env already exists
 conda activate airhockey2023
 # CUDA jaxlib for GPU inference (A6000 = sm_86; driver >= 570 already installed)
 pip install "jax[cuda12_pip]==0.4.23" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
@@ -142,10 +148,10 @@ converter uses only images and actions.
 
 The versioned YAML config is the source of truth for reproducible SA data:
 [`configs/data/airhockey-v6.yaml`](configs/data/airhockey-v6.yaml). It defines
-5,000 games × 1,000 transitions = 5,000,000 transitions at 128 px / 50 Hz:
-3,500 aggressive-vs-aggressive games on 17 CPU workers and 1,500
-smooth-random-vs-smooth-random games on 7 workers. Both sources use a 10 cm
-puck, 10 cm physical mallets, 2.5× arm visuals, a fixed-scale marker, and a
+1,000 games × 1,000 transitions = 1,000,000 transitions at 128 px / 50 Hz:
+500 aggressive-vs-aggressive and 500 smooth-random-vs-smooth-random games,
+on 12 CPU workers each. Both sources use a 10 cm puck, 10 cm physical
+mallets, 1.5× arm visuals, a fixed-scale marker, and a
 0.5% per-active-step independent pause onset probability with 50--250-frame
 holds.
 
@@ -163,10 +169,10 @@ bash scripts/collect_sa_dataset.sh
 ```
 
 - Raw 128 px masters accumulate in
-  `~/data/raw_2023_puck100_mallet100_arm25_v6/{aggressive,random}`; the H5
-  root is `~/data/airhockey_sa_h5_puck100_mallet100_arm25_v6_5m`. The YAML
+  `~/data/raw_2023_puck100_mallet100_arm15_v6_1m/{aggressive,random}`; the H5
+  root is `~/data/airhockey_sa_h5_puck100_mallet100_arm15_v6_1m`. The YAML
   counts are target totals: re-running collects only the remaining completed
-  games to reach 3,500 + 1,500, ignores incomplete game directories, chooses
+  games to reach 500 + 500, ignores incomplete game directories, chooses
   fresh seeds, then rebuilds H5 from completed raw games. It snapshots the
   YAML under `raw/.collection/` and holds a root lock, so run only one
   launcher per raw root. Use `--skip-convert` to collect raw data only; use
@@ -182,7 +188,7 @@ bash scripts/collect_sa_dataset.sh
 - `X/sa/configs/recipe-airhockey-v1.yaml` deliberately remains pointed at the
   old v1 data. For this v6 physical-mallet variant, copy that recipe and set
   `args.data_dir` to
-  `/home_shared/grail_charles/data/airhockey_sa_h5_puck100_mallet100_arm25_v6_5m` plus a
+  `/home_shared/grail_charles/data/airhockey_sa_h5_puck100_mallet100_arm15_v6_1m` plus a
   new `args.ckpt_dir_name` before launching. (The recipe overrides CLI
   `--data_dir`.) It keeps the same sketchy-v4 hyperparameters, `action_dim: 4`,
   and seq_len-20 dense windows.
@@ -190,8 +196,8 @@ bash scripts/collect_sa_dataset.sh
 ```bash
 cd /home_shared/grail_charles/X/sa
 # after copying/configuring the v6 recipe described above:
-python main.py --config configs/sa-episodic.py --recipe configs/recipe-airhockey-puck100-mallet100-arm25-v6.yaml \
-    --wandb_project sa-airhockey --wandb_entity charlesji --wandb_run_name airhockey_puck100_mallet100_arm25_v6
+python main.py --config configs/sa-episodic.py --recipe configs/recipe-airhockey-puck100-mallet100-arm15-v6.yaml \
+    --wandb_project sa-airhockey --wandb_entity charlesji --wandb_run_name airhockey_puck100_mallet100_arm15_v6
 ```
 
 ## Running on different machines
